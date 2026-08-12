@@ -8,11 +8,47 @@ No database, no embedded KV store, no broker. Storage is an append-only log
 this repo implements, with group-commit fsync, crash recovery, and compaction.
 The only dependency is the Go standard library.
 
+**What it guarantees, stated plainly:** at-least-once delivery, so consumers
+must be idempotent. Every enqueue is on disk before its `201`. A message the
+server confirmed survives `kill -9`; a message it confirmed the ack for stays
+gone. A log it cannot fully trust stops it from starting rather than being
+quietly skipped past. It is a single node with no replication, so one disk is
+one failure domain.
+
 ```bash
 go build -o artie-queue ./cmd/artie-queue
 go run ./cmd/jobrunner              # supervises the server, serves the dashboard
 open http://localhost:8081
 ```
+
+### The four required answers
+
+Answered in full further down; linked here so they are not buried.
+
+1. [How do you handle replay messages?](#1-how-do-you-handle-replay-messages) —
+   two different things share that name, and they get different answers.
+2. [How would you refactor this into a Pub/Sub?](#2-how-would-you-refactor-your-queue-into-a-pubsub) —
+   the log is already the topic; the hard part is that priority and LIFO are
+   *per-subscriber* orderings.
+3. [What would you add with more time?](#3-what-would-you-add-with-more-time) —
+   five things, in the order I would actually do them.
+4. [Why choose this over SQS, RabbitMQ, or Pulsar?](#4-why-would-anyone-choose-this-over-sqs-rabbitmq-or-pulsar) —
+   mostly you shouldn't; here is the narrow case where you would, and where it
+   loses.
+
+### Requirements, and where each is met
+
+| the assignment asked for | where |
+|---|---|
+| FIFO or LIFO | `Config.Ordering`, one comparator ([below](#the-one-idea-worth-stealing)) |
+| Priority | `Config.PriorityEnabled`, primary over the mode ([decision 1](#1-priority-is-primary-the-ordering-mode-tie-breaks-within-a-priority-level)) |
+| Delay | per-message `delay_ms`, gated by the delayed heap |
+| Composable into e.g. delayed priority-LIFO | eight compositions from one comparator; the demo switches between five of them live |
+| Persisted, durable, survives restarts | append-only log, fsync before every 2xx, [crash test](#tests) |
+| Storage not delegated to a queue or database | stdlib only — the log is [`internal/wal/`](internal/wal/) |
+| Concurrency | one mutex per queue, group commit, [tested under `-race`](#concurrency) |
+| An application that uses it | [`cmd/jobrunner`](cmd/jobrunner) — worker pool + live dashboard |
+| The four questions answered | [top of this file](#the-four-required-answers), in full [below](#the-four-questions-answered) |
 
 ---
 
@@ -43,10 +79,24 @@ func (c *Config) less(a, b *Message) bool {
 
 Delay is not a fifth case. **Delay is a gate in front of the same comparator**:
 a message that is not yet visible simply isn't in the structure that `dequeue`
-looks at. So each row above is also its delayed variant, which is where the
-other two of the six types come from.
+looks at. So every row above is also its delayed variant — four orderings ×
+delay on or off = **eight compositions, one comparator, zero special cases**.
+Delay is per message, so a single queue can hold both at once.
+
+Adding a fifth ordering rule would mean writing one more branch in one function,
+not another subsystem. That is the test of whether the abstraction is real.
 
 That is the whole design. Everything below is about making it durable.
+
+### If you only have ten minutes
+
+| look at | why |
+|---|---|
+| [`internal/queue/message.go`](internal/queue/message.go) → `less()` | the comparator above, in context — 12 lines, eight queue types |
+| [`internal/wal/record.go`](internal/wal/record.go) | the record format, and why it carries two checksums |
+| [`internal/wal/log.go`](internal/wal/log.go) → `Append` / `Wait` | group commit: durable before the 201, without one fsync per message |
+| [`internal/integration/crash_test.go`](internal/integration/crash_test.go) | `kill -9` against the real binary — the test the whole design exists to pass |
+| the demo's **corruption lab** | the startup policy, as something you can click |
 
 ---
 
@@ -262,7 +312,7 @@ window is still open) are written explicitly into the compaction snapshot as
 
 ---
 
-## The four questions
+## The four questions, answered
 
 ### 1. How do you handle replay messages?
 
@@ -419,7 +469,7 @@ go test ./... -race
 | `TestServerRefusesToStartOnCorruptLog` | end-to-end: mid-log checksum mismatch → non-zero exit naming the offset → `verify` → `repair` → clean start |
 | `TestServerTruncatesTornTailAndStarts` | a valid header with a missing payload is truncated with a warning, not refused |
 | `TestInflatedLengthIsCorruptionNotATornTail` | regression: a damaged length field is corruption, not a torn write |
-| `TestOrderingModes` / `TestDelayedVariantsRespectTheSameComparator` | all six queue types, exact expected sequences |
+| `TestOrderingModes` / `TestDelayedVariantsRespectTheSameComparator` | all eight compositions, against exact expected sequences |
 | `TestRestartPreservesOrderingForEveryMode` | ordering after a restart is byte-identical to ordering without one |
 | `TestConcurrentProducersAndConsumers` | 8 producers / 4 consumers: everything delivered, nothing leased twice, nothing acked twice |
 | `TestGroupCommitBatchesConcurrentWriters` | concurrent writers share fsyncs and all records replay, in order |
@@ -435,13 +485,34 @@ go test ./... -race
 | `TestLargePrioritiesSurviveRestartUnchanged` | the priority that comes out of the log is the priority that went in, at every 32-bit boundary |
 | `TestInstallReportsWhetherTheRenameLanded` | compaction can tell a failure before the swap from one after it, because they need opposite handling |
 
-The suite also fuzzes (`go test ./internal/wal -fuzz FuzzReplay`) and
-benchmarks (`go test ./internal/queue -bench .`).
-
 The crash test asserts on *bounds*, not exact totals, and the width of the band
 is exactly the number of requests in flight when the process died — an
 unanswered request may or may not have committed, and pretending otherwise
 would be testing a fiction.
+
+### Checking the claims yourself
+
+Every claim above is one command away, and they all run in under a minute:
+
+```bash
+# durability: SIGKILL the real binary mid-load, restart, assert nothing
+# acknowledged was lost and nothing acked came back
+go test ./internal/integration -run Kill9 -v
+
+# the corruption policy end to end: refuse, verify, repair, restart
+go test ./internal/integration -run 'Corrupt|TornTail' -v
+
+# ordering for all eight compositions, before and after a restart
+go test ./internal/queue -run 'Ordering|Delayed' -v
+
+# throw arbitrary bytes at the log reader (seed corpus runs by default)
+go test ./internal/wal -run FuzzReplay -fuzz FuzzReplay -fuzztime 60s
+
+# the group-commit numbers in the table above
+go test ./internal/queue -bench Enqueue -benchtime 500x
+```
+
+The whole suite is `go test ./... -race`, which takes about 30 seconds.
 
 ---
 
@@ -476,9 +547,16 @@ curl -X POST localhost:8080/queues/jobs/dequeue \
   -d '{"max_messages":10,"visibility_timeout_ms":30000}'
 ```
 
-Status codes: `201` new message, `200` duplicate (with the original id), `404`
-unknown queue or message, `409` ack/nack of a message that isn't leased, `503`
-the log has failed and the queue has stopped accepting work.
+Status codes: `201` new message · `200` duplicate, carrying the original id ·
+`400` malformed or invalid request · `404` unknown queue or message · `409`
+queue name taken, or ack/nack of a message that isn't leased · `413` payload
+over 256 KiB · `503` the log has failed and the queue has stopped accepting
+work.
+
+The one endpoint not in the assignment's list is `peek`, which reads the queue
+in comparator order without taking a lease. It exists because the dashboard
+needs to show ordering, and because "what would this queue hand me next, and
+why" is the first question anyone debugging a priority queue asks.
 
 ---
 
@@ -517,7 +595,9 @@ at a different composition.
 
 ---
 
-## Notes on what isn't durable, on purpose
+## Implementation notes
+
+### What isn't durable, on purpose
 
 **Dequeue writes nothing to the log.** A lease is not durable state: if the
 process dies, every in-flight message correctly reappears as ready, which is
@@ -525,6 +605,8 @@ exactly what lease expiry would have done anyway. The cost is that a crash can
 under-count `Attempts` by one, which is cheaper than an fsync on the read path.
 Lease *expiry* is logged, because attempt counts decide dead-lettering and
 those must survive.
+
+### Compaction
 
 **Compaction** snapshots live state to a temp file, fsyncs it, atomically
 renames it over the log, fsyncs the directory, then swaps the descriptor. A
@@ -548,6 +630,8 @@ larger than the threshold can never get back under it, so it would re-compact
 on every timer tick forever, rewriting the whole log to reclaim nothing. The
 doubling rule bounds write amplification to a constant factor.
 
+### Counters and interrupted creates
+
 **Counters** in `/stats` (`enqueued`, `acked`, `dead_lettered`, …) count what
 *this process* has done, so a restart resets them; queue depths are recovered
 state and do not. They are incremented by the public methods rather than inside
@@ -565,3 +649,46 @@ its log holds a committed record, not by whether a file is present: a torn META
 is non-empty but commits nothing, and treating it as existing would leave the
 name skipped at boot yet permanently unusable. Creating over a log that is
 *corrupt* rather than incomplete still refuses — that file may hold real data.
+
+---
+
+## What this got wrong first
+
+Every one of these passed its tests before it was found. They are here because
+the class of bug is the interesting part, and because a durability claim is
+only worth as much as the effort spent trying to break it.
+
+**A corrupt length field masqueraded as a torn write.** The original format had
+one checksum per record. A flipped bit in a length field made the record claim
+to run past EOF — indistinguishable from an interrupted write — so the reader
+truncated and discarded every valid record behind it, with only a warning.
+Exactly the silent loss the corruption policy exists to prevent. Found by
+pointing the demo's corruption lab at the format that was supposed to survive
+it. Fixed with the header checksum described above.
+
+**Compaction failed open.** `CommitAs` fsynced the directory *after* the
+rename, so a failure there returned an error after the swap had committed. The
+caller treated all errors alike: no reopen, no fail-closed. The queue then
+appended to an unlinked inode, fsynced it, and answered `200` with a durability
+guarantee — while the log a restart would read contained none of it. The fix is
+that the installer now reports *whether the rename landed*, separately from the
+error, because before and after the swap need opposite handling.
+
+**Priority was stored narrower than it was compared.** Persisted as `int32`
+while `Message.Priority` is a Go `int`. A priority past 2³¹ was accepted,
+acknowledged, then silently reinterpreted on replay — a running queue ordered
+on the value the client sent, a recovered queue on its low 32 bits
+sign-extended, so the highest-priority message could come back as the lowest.
+Rejecting large priorities would have fixed the symptom; widening the stored
+field to match the in-memory type removes the failure mode, leaving no rule for
+a future change to forget.
+
+**Compaction could thrash**, rewriting the whole log every tick when live state
+already exceeded the threshold. **An interrupted create could brick startup**,
+taking every other healthy queue down with it. **A failed queue spun** at 1 ms
+forever instead of going quiet.
+
+The through-line: four of the six were *fail-open* paths — an error handled by
+carrying on rather than stopping. For a queue whose entire pitch is "we tell
+you the truth about what is durable", fail-open is the failure mode worth
+hunting deliberately, because it is the one that never shows up as a crash.
