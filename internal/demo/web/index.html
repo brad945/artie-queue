@@ -622,35 +622,82 @@ function taskName(payload) {
   return "job";
 }
 
+// Both of these reuse DOM nodes rather than rewriting innerHTML. Replacing the
+// markup wholesale would recreate every card on each 250ms snapshot, and since
+// .card carries an entrance animation, the panels would visibly re-animate four
+// times a second even when nothing changed.
+
+const OUTCOME = {
+  done:      {color: "var(--done)",     label: "acked"},
+  failed:    {color: "var(--inflight)", label: "nacked"},
+  abandoned: {color: "var(--dead)",     label: "abandoned"},
+};
+
 function renderDone(recent) {
-  const items = recent.slice().reverse();
-  const el = $("colDone");
-  el.innerHTML = items.map(c => {
-    const color = c.outcome === "done" ? "var(--done)" : c.outcome === "failed" ? "var(--inflight)" : "var(--dead)";
-    const label = c.outcome === "done" ? "acked" : c.outcome === "failed" ? "nacked" : "abandoned";
-    return `<div class="card" style="border-left-color:${color}">
-      <div class="row1">
-        <span class="badge" style="color:var(--p${Math.max(0,Math.min(4,c.priority))})">p${c.priority}</span>
-        <span class="task">${esc(c.task)}</span>
-        <span class="seq">#${c.seq}</span>
-      </div>
-      <div class="row2"><span style="color:${color}">${label}</span><span>worker ${c.worker}</span></div>
-    </div>`;
-  }).join("");
+  const items = recent.slice().reverse().map(c => ({
+    ...c, id: `${c.seq}-${c.at_ms}-${c.outcome}`,
+  }));
+  keyed($("colDone"), items, makeDoneCard, updateDoneCard);
+}
+
+function makeDoneCard(c) {
+  const el = document.createElement("div");
+  el.className = "card";
+  el.innerHTML =
+    `<div class="row1">
+       <span class="badge prio"></span>
+       <span class="task"></span>
+       <span class="seq"></span>
+     </div>
+     <div class="row2"><span class="outcome"></span><span class="who"></span></div>`;
+  updateDoneCard(el, c);
+  return el;
+}
+
+function updateDoneCard(el, c) {
+  const o = OUTCOME[c.outcome] || OUTCOME.done;
+  const p = Math.max(0, Math.min(4, c.priority));
+  el.style.borderLeftColor = o.color;
+  const prio = el.querySelector(".prio");
+  prio.textContent = "p" + c.priority;
+  prio.style.color = `var(--p${p})`;
+  el.querySelector(".task").textContent = c.task;
+  el.querySelector(".seq").textContent = "#" + c.seq;
+  const outcome = el.querySelector(".outcome");
+  outcome.textContent = o.label;
+  outcome.style.color = o.color;
+  el.querySelector(".who").textContent = "worker " + c.worker;
 }
 
 function renderWorkers(workers) {
-  $("workerList").innerHTML = workers.map(w => {
-    const busy = w.state === "working";
-    const color = busy ? "var(--inflight)" : w.state === "no server" ? "var(--dead)" : "var(--dimmer)";
-    return `<div class="card" style="width:170px;border-left-color:${color}"
-                 data-started="${w.started_ms||0}" data-total="${w.total_ms||0}">
-      <div class="row1"><span class="task">worker ${w.id}</span>
-        <span class="seq" style="color:${color}">${esc(w.state)}</span></div>
-      <div class="row2">${busy ? esc(w.task) + " · p" + w.priority : "&nbsp;"}</div>
-      ${busy ? `<div class="bar"><i style="background:var(--inflight)"></i></div>` : ""}
-    </div>`;
-  }).join("");
+  keyed($("workerList"), workers.map(w => ({...w, id: "w" + w.id})),
+        makeWorkerCard, updateWorkerCard);
+}
+
+function makeWorkerCard(w) {
+  const el = document.createElement("div");
+  el.className = "card";
+  el.style.width = "170px";
+  el.innerHTML =
+    `<div class="row1"><span class="task name"></span><span class="seq state"></span></div>
+     <div class="row2 job">&nbsp;</div>
+     <div class="bar"><i style="background:var(--inflight)"></i></div>`;
+  updateWorkerCard(el, w);
+  return el;
+}
+
+function updateWorkerCard(el, w) {
+  const busy = w.state === "working";
+  const color = busy ? "var(--inflight)" : w.state === "no server" ? "var(--dead)" : "var(--dimmer)";
+  el.style.borderLeftColor = color;
+  el.querySelector(".name").textContent = "worker " + w.id;
+  const state = el.querySelector(".state");
+  state.textContent = w.state;
+  state.style.color = color;
+  el.querySelector(".job").textContent = busy ? `${w.task} · p${w.priority}` : " ";
+  el.querySelector(".bar").style.visibility = busy ? "visible" : "hidden";
+  el.dataset.started = w.started_ms || 0;
+  el.dataset.total = w.total_ms || 0;
 }
 
 // keyed reconciliation so cards animate in and out instead of flashing.
