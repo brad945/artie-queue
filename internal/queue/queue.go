@@ -22,6 +22,10 @@ var (
 	ErrNotInFlight = errors.New("message is not in flight")
 	// ErrClosed means the queue has been shut down.
 	ErrClosed = errors.New("queue is closed")
+	// ErrIncompleteQueue means a queue directory holds a log with no records
+	// at all — a create that was interrupted before it committed anything.
+	// It is not corruption: there is no data, so there is nothing to lose.
+	ErrIncompleteQueue = errors.New("queue was never fully created")
 )
 
 const (
@@ -71,6 +75,13 @@ type Queue struct {
 	closed    bool
 
 	compactThreshold int64
+	// compactFloor stops compaction from thrashing. A queue whose *live* state
+	// is already larger than the threshold would otherwise re-compact on every
+	// timer tick forever, rewriting the whole log each time and reclaiming
+	// nothing. After each compaction the floor is set to twice the resulting
+	// size, so the log has to genuinely double before it is worth rewriting
+	// again — which bounds write amplification to a constant factor.
+	compactFloor int64
 
 	wake      chan struct{}
 	done      chan struct{}
@@ -115,13 +126,33 @@ func Create(root string, cfg Config, logf func(string, ...any)) (*Queue, error) 
 		return nil, err
 	}
 	dir := filepath.Join(root, cfg.Name)
-	if _, err := os.Stat(filepath.Join(dir, logFileName)); err == nil {
-		return nil, fmt.Errorf("queue %q already exists", cfg.Name)
+	path := filepath.Join(dir, logFileName)
+
+	// Decide "does this queue already exist?" by asking whether its log holds
+	// any committed record — the same question Load asks — rather than whether
+	// a file is present. A create interrupted part-way through writing its
+	// META record leaves a non-empty file containing nothing committed; if
+	// that counted as "exists", the name would be unusable forever while
+	// startup simultaneously skipped it as incomplete.
+	if _, err := os.Stat(path); err == nil {
+		res, err := wal.Replay(path, func(wal.Record) error { return nil })
+		if err != nil {
+			// Corruption. Do not overwrite it — that would destroy whatever is
+			// in there. Surface it so an operator can look.
+			return nil, fmt.Errorf("queue %q already has a log that cannot be read: %w", cfg.Name, err)
+		}
+		if res.Records > 0 {
+			return nil, fmt.Errorf("%w: %q", ErrQueueExists, cfg.Name)
+		}
+		// No committed records: the previous create never finished. Starting
+		// over loses nothing, because nothing was ever acknowledged.
 	}
 	q := newQueue(dir, logf)
 	q.cfg = cfg
-	q.path = filepath.Join(dir, logFileName)
+	q.path = path
 
+	// Opening at size 0 truncates any incomplete prefix left by the
+	// interrupted create above.
 	log, err := wal.Open(q.path, 0)
 	if err != nil {
 		return nil, err
@@ -169,7 +200,16 @@ func Load(root, name string, logf func(string, ...any)) (*Queue, error) {
 		return nil, err
 	}
 	if !sawMeta {
-		return nil, fmt.Errorf("queue %q: log %s has no META record", name, q.path)
+		if res.Records == 0 {
+			// The log exists but contains nothing: a crash between creating
+			// the file and committing its META record. No record was ever
+			// written, so nothing was ever acknowledged and there is nothing
+			// to lose. Report it distinctly so startup can carry on without
+			// this queue instead of refusing to boot at all — the alternative
+			// is one interrupted create bricking every other queue on the box.
+			return nil, fmt.Errorf("%w: %s", ErrIncompleteQueue, q.path)
+		}
+		return nil, fmt.Errorf("queue %q: log %s has records but no META record", name, q.path)
 	}
 	if res.Torn != nil {
 		q.logf("WARN queue %q: torn record at end of log (offset %d, %d bytes discarded); "+
@@ -240,7 +280,8 @@ func (q *Queue) apply(rec wal.Record) error {
 	case wal.TypeAck:
 		return q.applyAck(string(rec.Payload))
 	case wal.TypeNack, wal.TypeLeaseExpire:
-		return q.applyAttempt(string(rec.Payload), time.Now())
+		_, err := q.applyAttempt(string(rec.Payload), time.Now())
+		return err
 	case wal.TypeDedup:
 		e, err := decodeDedup(rec.Payload)
 		if err != nil {
@@ -300,17 +341,24 @@ func (q *Queue) applyAck(id string) error {
 	}
 	q.detach(m)
 	delete(q.byID, id)
-	q.counters.Acked++
 	return nil
 }
 
 // applyAttempt handles both nack and lease expiry: they are the same state
 // transition (a delivery that did not succeed), differing only in what caused
-// them, which the record type already records.
-func (q *Queue) applyAttempt(id string, now time.Time) error {
+// them, which the record type already records. It reports whether the message
+// crossed into the dead-letter queue.
+//
+// Counters are deliberately *not* touched here. These functions run during
+// replay as well as on the live path, and a counter incremented in both places
+// would mean different things depending on whether the log had been compacted
+// since — a compacted snapshot restores dead-lettered messages as plain
+// records, so replaying it would count zero dead-letterings for the same
+// state. Counters live in the callers and mean "since this process started".
+func (q *Queue) applyAttempt(id string, now time.Time) (deadLettered bool, err error) {
 	m, ok := q.byID[id]
 	if !ok {
-		return fmt.Errorf("attempt record for unknown message %q", id)
+		return false, fmt.Errorf("attempt record for unknown message %q", id)
 	}
 	q.detach(m)
 	m.Attempts++
@@ -318,14 +366,13 @@ func (q *Queue) applyAttempt(id string, now time.Time) error {
 		m.state = stateDead
 		m.index = -1
 		q.dlq = append(q.dlq, m)
-		q.counters.DeadLettered++
-		return nil
+		return true, nil
 	}
 	// Requeued immediately, keeping its original Seq so it returns to its
 	// place in the ordering rather than to the back of the queue.
 	m.VisibleAt = now
 	q.place(m, now)
-	return nil
+	return false, nil
 }
 
 // detach removes a message from whichever structure currently holds it.
@@ -504,6 +551,7 @@ func (q *Queue) Ack(id string) error {
 		q.mu.Unlock()
 		return err
 	}
+	q.counters.Acked++
 	q.mu.Unlock()
 	return q.waitDurable(batch)
 }
@@ -530,11 +578,15 @@ func (q *Queue) Nack(id string) error {
 		q.mu.Unlock()
 		return err
 	}
-	if err := q.applyAttempt(id, time.Now()); err != nil {
+	dead, err := q.applyAttempt(id, time.Now())
+	if err != nil {
 		q.mu.Unlock()
 		return err
 	}
 	q.counters.Nacked++
+	if dead {
+		q.counters.DeadLettered++
+	}
 	q.mu.Unlock()
 
 	if err := q.waitDurable(batch); err != nil {
@@ -583,6 +635,14 @@ func (q *Queue) run() {
 // polls: each deadline comes from the head of a heap.
 func (q *Queue) tick() time.Time {
 	q.mu.Lock()
+	if q.failed != nil || q.closed {
+		// A queue whose log has failed has nothing left to schedule. Without
+		// this the expired-lease loop below would fail to append, break, and
+		// leave an already-past deadline as the next wakeup — a 1ms spin for
+		// as long as the process lives.
+		q.mu.Unlock()
+		return time.Time{}
+	}
 	now := time.Now()
 	var maxBatch uint64
 
@@ -601,11 +661,15 @@ func (q *Queue) tick() time.Time {
 		if batch > maxBatch {
 			maxBatch = batch
 		}
-		if err := q.applyAttempt(m.ID, now); err != nil {
+		dead, err := q.applyAttempt(m.ID, now)
+		if err != nil {
 			q.failed = err
 			break
 		}
 		q.counters.Expired++
+		if dead {
+			q.counters.DeadLettered++
+		}
 	}
 
 	q.agePriorities(now)
@@ -619,7 +683,9 @@ func (q *Queue) tick() time.Time {
 		q.lastPurge = now
 	}
 
-	shouldCompact := q.failed == nil && !q.closed && q.log.Size() >= q.compactThreshold
+	size := q.log.Size()
+	shouldCompact := q.failed == nil && !q.closed &&
+		size >= q.compactThreshold && size >= q.compactFloor
 	next := q.nextDeadlineLocked(now)
 	q.mu.Unlock()
 
@@ -816,6 +882,8 @@ func (q *Queue) Compact() error {
 		q.failed = err
 		return err
 	}
+	// The log must double before another automatic compaction is worth doing.
+	q.compactFloor = 2 * size
 	q.counters.Compactions++
 	q.logf("queue %q: compacted log %d -> %d bytes (%d live messages, %d dedup entries)",
 		q.cfg.Name, before, size, len(live), len(orphans))

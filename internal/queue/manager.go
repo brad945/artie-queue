@@ -1,12 +1,17 @@
 package queue
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 )
+
+// ErrQueueExists distinguishes "that name is taken" from "that configuration
+// is invalid", so the HTTP layer can answer 409 rather than 400.
+var ErrQueueExists = errors.New("queue already exists")
 
 // Manager owns every queue in a data directory. Each queue is a directory
 // holding its own independent log, which keeps compaction local to one queue
@@ -47,6 +52,14 @@ func OpenManager(root string, logf func(string, ...any)) (*Manager, error) {
 		}
 		q, err := Load(root, name, logf)
 		if err != nil {
+			if errors.Is(err, ErrIncompleteQueue) {
+				// Loud, but not fatal: this queue holds no data and never
+				// finished being created. Refusing to boot over it would let
+				// one interrupted create take down every healthy queue too.
+				logf("WARN skipping queue %q: %v (create it again to use it; "+
+					"no records were ever written to it)", name, err)
+				continue
+			}
 			m.Close()
 			return nil, fmt.Errorf("loading queue %q: %w", name, err)
 		}
@@ -66,7 +79,7 @@ func (m *Manager) Create(cfg Config) (*Queue, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.queues[cfg.Name]; ok {
-		return nil, fmt.Errorf("queue %q already exists", cfg.Name)
+		return nil, fmt.Errorf("%w: %q", ErrQueueExists, cfg.Name)
 	}
 	q, err := Create(m.root, cfg, m.logf)
 	if err != nil {

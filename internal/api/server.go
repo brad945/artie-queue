@@ -80,7 +80,13 @@ func (s *Server) createQueue(w http.ResponseWriter, r *http.Request) {
 	}
 	q, err := s.mgr.Create(cfg)
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		// A taken name is a conflict; a bad ordering or a name with a path
+		// separator in it is the client's mistake.
+		if errors.Is(err, queue.ErrQueueExists) {
+			writeError(w, http.StatusConflict, err)
+		} else {
+			writeError(w, http.StatusBadRequest, err)
+		}
 		return
 	}
 	writeJSON(w, http.StatusCreated, q.Stats())
@@ -150,8 +156,11 @@ func (s *Server) dequeue(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The body is optional: a bare POST means "one message, default
+	// visibility". Clients that stream the request have ContentLength -1, so
+	// an empty body has to be tolerated rather than length-checked.
 	var req dequeueRequest
-	if r.ContentLength != 0 && !decode(w, r, &req) {
+	if !decodeOptional(w, r, &req) {
 		return
 	}
 	if req.MaxMessages <= 0 {
@@ -290,6 +299,20 @@ func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	dec := json.NewDecoder(io.LimitReader(r.Body, MaxPayloadBytes+4096))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
+		return false
+	}
+	return true
+}
+
+// decodeOptional is decode for endpoints whose body may legitimately be empty.
+func decodeOptional(w http.ResponseWriter, r *http.Request, dst any) bool {
+	dec := json.NewDecoder(io.LimitReader(r.Body, MaxPayloadBytes+4096))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) {
+			return true
+		}
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
 		return false
 	}
