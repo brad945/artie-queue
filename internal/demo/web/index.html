@@ -725,9 +725,15 @@ function keyed(container, items, make, update) {
     } else {
       node = make(it);
       node.dataset.id = key;
-      node.animate(
-        [{opacity: 0, transform: "translateY(-5px)"}, {opacity: 1, transform: "none"}],
-        {duration: 220, easing: "ease-out"});
+      // Only animate when the page is actually being looked at. A hidden tab
+      // freezes animations at their first keyframe, so a card created in the
+      // background would sit at opacity 0 — invisible — until the tab is
+      // foregrounded again. The entrance is decoration; being visible is not.
+      if (!document.hidden) {
+        node.animate(
+          [{opacity: 0, transform: "translateY(-5px)"}, {opacity: 1, transform: "none"}],
+          {duration: 220, easing: "ease-out"});
+      }
     }
     nodes.push(node);
   }
