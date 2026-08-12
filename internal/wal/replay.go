@@ -176,26 +176,38 @@ func (w *Writer) Append(t Type, payload []byte) error {
 // Size reports the bytes written so far.
 func (w *Writer) Size() int64 { return w.size }
 
-// CommitAs flushes, fsyncs, and atomically renames the temp file over final.
+// Install flushes, fsyncs, and atomically renames the temp file over final.
 // The sequence — write, fsync the data, rename, fsync the directory — is what
 // makes the swap crash-safe: after it, a reader sees either the whole old log
 // or the whole new one, never a half-written snapshot.
-func (w *Writer) CommitAs(final string) error {
+//
+// installed reports whether the rename took effect, and it is reported
+// separately from err because the two failure modes need opposite handling.
+// Before the rename, nothing has changed: the old log is still live and the
+// caller can carry on. After it, the file the caller had open is an unlinked
+// inode that no future reader will ever see, so continuing to append to it
+// would acknowledge writes that are already lost. The caller cannot tell those
+// apart from the error alone, so it is returned explicitly.
+func (w *Writer) Install(final string) (installed bool, err error) {
 	if err := w.bw.Flush(); err != nil {
 		w.f.Close()
-		return err
+		return false, err
 	}
 	if err := w.f.Sync(); err != nil {
 		w.f.Close()
-		return err
+		return false, err
 	}
 	if err := w.f.Close(); err != nil {
-		return err
+		return false, err
 	}
 	if err := os.Rename(w.tmp, final); err != nil {
-		return err
+		return false, err
 	}
-	return syncDir(dirOf(final))
+	// From here the swap has happened.
+	if err := syncDir(dirOf(final)); err != nil {
+		return true, fmt.Errorf("renamed %s into place but could not fsync its directory: %w", final, err)
+	}
+	return true, nil
 }
 
 // Abort removes the temp file after a failed snapshot.

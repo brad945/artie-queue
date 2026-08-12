@@ -439,6 +439,86 @@ func TestCompactionUnderConcurrentLoadLosesNothing(t *testing.T) {
 		compactions, nAccepted, nAcked, len(survivors))
 }
 
+// A priority is accepted, acknowledged, and used to order the queue — so the
+// value that comes back out of the log has to be the value that went in. When
+// the stored field was narrower than the in-memory one, a large priority was
+// silently reinterpreted on replay: the running queue ordered on what the
+// client sent, the recovered queue ordered on its low 32 bits sign-extended,
+// and the highest-priority message could come back as the lowest.
+func TestLargePrioritiesSurviveRestartUnchanged(t *testing.T) {
+	q, root := mustQueue(t, Config{Ordering: FIFO, PriorityEnabled: true})
+
+	// Values that straddle every 32-bit boundary that matters.
+	priorities := []int{
+		0, 1, -1,
+		1 << 30,
+		1<<31 - 1, // int32 max
+		1 << 31,   // one past it: used to come back negative
+		1 << 32,   // used to come back as 0
+		3000000000,
+		-(1 << 31), -(1 << 33),
+		1<<62 - 1,
+	}
+	want := make(map[string]int, len(priorities))
+	for i, p := range priorities {
+		body := fmt.Sprintf("m%02d", i)
+		if _, err := q.Enqueue([]byte(body), p, 0, ""); err != nil {
+			t.Fatalf("enqueue priority %d: %v", p, err)
+		}
+		want[body] = p
+	}
+
+	liveOrder := drain(t, q, 100)
+	for _, id := range inFlightIDs(q) {
+		if err := q.Nack(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Nack bumps attempts but not priority; order must be unchanged.
+	q2 := reopen(t, q, root)
+
+	q2.mu.Lock()
+	for _, m := range q2.byID {
+		if got := m.Priority; got != want[string(m.Payload)] {
+			t.Errorf("message %q priority %d -> %d across restart",
+				m.Payload, want[string(m.Payload)], got)
+		}
+	}
+	q2.mu.Unlock()
+
+	recoveredOrder := drain(t, q2, 100)
+	if len(recoveredOrder) != len(liveOrder) {
+		t.Fatalf("recovered %d messages, want %d", len(recoveredOrder), len(liveOrder))
+	}
+	for i := range liveOrder {
+		if liveOrder[i] != recoveredOrder[i] {
+			t.Fatalf("delivery order drifted across restart at position %d: live %v, recovered %v",
+				i, liveOrder, recoveredOrder)
+		}
+	}
+}
+
+// A log written by an older format version must be refused, not misread. The
+// version byte exists precisely so that a layout change fails loudly.
+func TestUnknownMessageFormatVersionIsRefused(t *testing.T) {
+	m := &Message{ID: "abc", Seq: 1, Priority: 3, CreatedAt: time.Now(), VisibleAt: time.Now()}
+	encoded := encodeMessage(m)
+
+	if _, err := decodeMessage(encoded); err != nil {
+		t.Fatalf("current version should decode: %v", err)
+	}
+	older := append([]byte(nil), encoded...)
+	older[0] = messageFormatVersion - 1
+	if _, err := decodeMessage(older); err == nil {
+		t.Fatal("a message written by an older format version was decoded anyway")
+	}
+	newer := append([]byte(nil), encoded...)
+	newer[0] = messageFormatVersion + 1
+	if _, err := decodeMessage(newer); err == nil {
+		t.Fatal("a message written by a newer format version was decoded anyway")
+	}
+}
+
 // checkInvariants asserts the structural rules the whole engine rests on.
 // Must be called with q.mu held.
 func checkInvariants(t *testing.T, q *Queue, when string) {

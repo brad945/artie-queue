@@ -16,7 +16,14 @@ import (
 // grow, and being able to read a queue's configuration out of a hexdump is
 // worth more there than a few saved bytes.
 
-const messageFormatVersion = 1
+// Version 2 widened Priority from 32 to 64 bits. In v1 a priority outside the
+// int32 range was accepted, acknowledged, and then silently reinterpreted on
+// replay — so a running queue ordered on the value the client sent while a
+// recovered queue ordered on its low 32 bits, sign-extended. Rejecting large
+// priorities would have fixed the symptom; making the stored field the same
+// width as the in-memory one removes the failure mode, so there is no rule
+// left to forget. A v1 log is refused loudly rather than misread.
+const messageFormatVersion = 2
 
 var errShortPayload = errors.New("queue: truncated record payload")
 
@@ -24,10 +31,10 @@ var errShortPayload = errors.New("queue: truncated record payload")
 // because compaction re-emits live messages as ENQUEUE records and must not
 // lose how many times they have already been tried.
 func encodeMessage(m *Message) []byte {
-	buf := make([]byte, 0, 46+len(m.ID)+len(m.DedupID)+len(m.Payload))
+	buf := make([]byte, 0, 50+len(m.ID)+len(m.DedupID)+len(m.Payload))
 	buf = append(buf, messageFormatVersion)
 	buf = binary.LittleEndian.AppendUint64(buf, m.Seq)
-	buf = binary.LittleEndian.AppendUint32(buf, uint32(int32(m.Priority)))
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(int64(m.Priority)))
 	buf = binary.LittleEndian.AppendUint64(buf, uint64(m.VisibleAt.UnixNano()))
 	buf = binary.LittleEndian.AppendUint64(buf, uint64(m.CreatedAt.UnixNano()))
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(m.Attempts))
@@ -43,18 +50,25 @@ func encodeMessage(m *Message) []byte {
 }
 
 func decodeMessage(b []byte) (*Message, error) {
-	if len(b) < 34 {
+	if len(b) < 38 {
 		return nil, errShortPayload
 	}
 	if b[0] != messageFormatVersion {
-		return nil, fmt.Errorf("queue: unsupported message format version %d", b[0])
+		return nil, fmt.Errorf("queue: unsupported message format version %d (this build writes version %d)",
+			b[0], messageFormatVersion)
 	}
 	m := &Message{}
 	p := 1
 	m.Seq = binary.LittleEndian.Uint64(b[p:])
 	p += 8
-	m.Priority = int(int32(binary.LittleEndian.Uint32(b[p:])))
-	p += 4
+	priority := int64(binary.LittleEndian.Uint64(b[p:]))
+	if int64(int(priority)) != priority {
+		// Only reachable on a 32-bit build reading a log written by a 64-bit
+		// one. Refusing beats silently reordering the queue.
+		return nil, fmt.Errorf("queue: priority %d does not fit this platform's int", priority)
+	}
+	m.Priority = int(priority)
+	p += 8
 	m.VisibleAt = time.Unix(0, int64(binary.LittleEndian.Uint64(b[p:])))
 	p += 8
 	m.CreatedAt = time.Unix(0, int64(binary.LittleEndian.Uint64(b[p:])))

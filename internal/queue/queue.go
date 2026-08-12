@@ -874,13 +874,30 @@ func (q *Queue) Compact() error {
 	}
 
 	size := w.Size()
-	if err := w.CommitAs(q.path); err != nil {
-		w.Abort()
-		return err
+	installed, err := w.Install(q.path)
+	if err != nil {
+		if !installed {
+			// The rename never happened: the old log is still live and intact,
+			// so the queue keeps running and simply has not been compacted.
+			w.Abort()
+			return err
+		}
+		// The rename did happen, but we could not finish making it durable.
+		// Our descriptor now points at an unlinked inode, and we cannot
+		// guarantee that anything written from here would ever be read back —
+		// so stop accepting work rather than acknowledge writes we might lose.
+		// The data itself is safe either way: a reader sees the old log or the
+		// new snapshot, both complete.
+		q.failed = fmt.Errorf("compaction of queue %q swapped the log into place but could not make the swap durable (%w); "+
+			"refusing further writes rather than acknowledging data that might not survive a restart", q.cfg.Name, err)
+		q.logf("FATAL %v", q.failed)
+		return q.failed
 	}
 	if err := q.log.Reopen(size); err != nil {
-		q.failed = err
-		return err
+		// Same situation: the new log is in place but we are not writing to it.
+		q.failed = fmt.Errorf("compaction of queue %q installed a new log but could not reopen it (%w); refusing further writes", q.cfg.Name, err)
+		q.logf("FATAL %v", q.failed)
+		return q.failed
 	}
 	// The log must double before another automatic compaction is worth doing.
 	q.compactFloor = 2 * size

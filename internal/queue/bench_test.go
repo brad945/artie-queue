@@ -134,11 +134,22 @@ func BenchmarkReplay(b *testing.B) {
 	}
 	const messages = 20000
 	payload := []byte(`{"task":"benchmark","n":12345}`)
-	for i := 0; i < messages; i++ {
-		if _, err := q.Enqueue(payload, i%5, 0, ""); err != nil {
-			b.Fatal(err)
-		}
+	// Build the log with concurrent producers: durability is identical, but
+	// group commit means the fixture takes a second instead of a minute.
+	var setup sync.WaitGroup
+	for w := 0; w < 32; w++ {
+		setup.Add(1)
+		go func(w int) {
+			defer setup.Done()
+			for i := w; i < messages; i += 32 {
+				if _, err := q.Enqueue(payload, i%5, 0, ""); err != nil {
+					b.Error(err)
+					return
+				}
+			}
+		}(w)
 	}
+	setup.Wait()
 	size := q.Stats().Log.SizeBytes
 	if err := q.Close(); err != nil {
 		b.Fatal(err)

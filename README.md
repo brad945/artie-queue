@@ -152,10 +152,23 @@ Appending happens under the queue mutex so that log order matches
 state-transition order; only the durability wait is outside it. That one rule
 is what makes replay reproduce exactly the state a crash interrupted.
 
-Measured on this laptop (Apple silicon, APFS): ~28 enqueues/sec/goroutine
-single-threaded, ~5,100/sec at 48 concurrent producers — with identical
-durability. The dashboard's **Burst** button shows the records-per-fsync number
-climbing live.
+Measured (`go test ./internal/queue -bench Enqueue`, Apple silicon, APFS):
+
+| producers | enqueues/sec | records per fsync | fsync latency |
+|---|---|---|---|
+| 1 | 297 | 1.0 | 3.3 ms |
+| 4 | 665 | 2.0 | 3.0 ms |
+| 16 | 2,307 | 7.7 | 3.4 ms |
+| 64 | 7,818 | 29.5 | 4.0 ms |
+
+The fsync itself costs the same throughout — that is the disk, and no amount of
+code makes it faster. What changes is how many messages each one carries.
+Throughput rises 26× while the durability guarantee is byte-for-byte identical
+at every row. The dashboard's **Burst** button shows the same number climbing
+live.
+
+Recovery is ~12.5 ms to replay 20,000 messages (1.6M records/sec, 101 bytes per
+message on disk), so restart time is not what the log costs you.
 
 There is **no per-message durability override**. Two durability stories in one
 queue is a worse product than one honest one, and "you can turn off safety"
@@ -412,6 +425,18 @@ go test ./... -race
 | `TestGroupCommitBatchesConcurrentWriters` | concurrent writers share fsyncs and all records replay, in order |
 | `TestExhaustedAttemptsDeadLetter` / `TestVisibilityExpiryEventuallyDeadLetters` | attempts drive dead-lettering, via both nack and lease expiry |
 | `TestCompactionPreservesSequenceCounter` | compacting an empty queue does not reset `Seq` and reorder future messages |
+| `TestRandomizedOperationsSurviveRestart` | 300 pseudo-random operations across 4 configurations and 5 seeds, restarted and compared message-by-message, then drained against an independently-written model of the comparator |
+| `FuzzReplay` | arbitrary bytes at the log reader: never panics, never surfaces an unverified record, and replaying the verified prefix is stable |
+| `TestStructuralInvariantsUnderConcurrentLoad` | every message is in exactly one structure, heap indices point back correctly, and the heap property holds — checked continuously while six goroutines mutate everything |
+| `TestCompactionUnderConcurrentLoadLosesNothing` | ~50 compactions while producers and consumers run, then restart: nothing acknowledged is lost, nothing acked returns |
+| `TestCompactionDoesNotThrashWhenLiveStateExceedsThreshold` | compaction cannot loop forever when there is nothing to reclaim |
+| `TestIncompleteQueueDoesNotBrickStartup` | an interrupted create does not stop the server or permanently poison the queue name |
+| `TestWriteFailureIsStickyAndFatal` | a failed write stops the log for good rather than pretending the next one might land |
+| `TestLargePrioritiesSurviveRestartUnchanged` | the priority that comes out of the log is the priority that went in, at every 32-bit boundary |
+| `TestInstallReportsWhetherTheRenameLanded` | compaction can tell a failure before the swap from one after it, because they need opposite handling |
+
+The suite also fuzzes (`go test ./internal/wal -fuzz FuzzReplay`) and
+benchmarks (`go test ./internal/queue -bench .`).
 
 The crash test asserts on *bounds*, not exact totals, and the width of the band
 is exactly the number of requests in flight when the process died — an
@@ -507,3 +532,36 @@ crash at any point leaves either the whole old log or the whole new one. The
 snapshot carries `NextSeq` forward explicitly — without it, compacting a fully
 drained queue would reset the sequence counter and reorder new messages against
 already-acknowledged history.
+
+Compaction distinguishes a failure *before* the rename from one *after* it,
+because they need opposite handling. Before: nothing changed, the old log is
+still live, the queue carries on uncompacted. After: the descriptor the queue
+holds points at an unlinked inode, so anything appended to it would be
+invisible to every future reader — the queue fails closed rather than
+acknowledge writes that are already lost. Collapsing both into one error is a
+fail-open: a failed directory fsync would silently discard everything written
+afterwards.
+
+Compaction triggers on log size, but the log must also have **doubled since the
+last snapshot**. Size alone is not enough: a queue whose live state is already
+larger than the threshold can never get back under it, so it would re-compact
+on every timer tick forever, rewriting the whole log to reclaim nothing. The
+doubling rule bounds write amplification to a constant factor.
+
+**Counters** in `/stats` (`enqueued`, `acked`, `dead_lettered`, …) count what
+*this process* has done, so a restart resets them; queue depths are recovered
+state and do not. They are incremented by the public methods rather than inside
+the shared `apply*` functions, because those run during replay too — and a
+compacted snapshot restores dead-lettered messages as ordinary records, so a
+counter incremented during replay would report a different number depending on
+whether compaction had happened.
+
+**An interrupted create** leaves a log with no committed record — either
+zero-length, or holding a partially written META. Startup warns and skips it
+rather than refusing, because it contains nothing anyone was told was durable,
+and refusing would let one interrupted create take every other queue on the box
+down with it. "Does this queue already exist?" is answered by asking whether
+its log holds a committed record, not by whether a file is present: a torn META
+is non-empty but commits nothing, and treating it as existing would leave the
+name skipped at boot yet permanently unusable. Creating over a log that is
+*corrupt* rather than incomplete still refuses — that file may hold real data.

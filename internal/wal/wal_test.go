@@ -394,7 +394,7 @@ func TestAppendOrderIsPreserved(t *testing.T) {
 	}
 }
 
-func TestWriterCommitAsIsAtomic(t *testing.T) {
+func TestWriterInstallIsAtomic(t *testing.T) {
 	dir := t.TempDir()
 	final := filepath.Join(dir, "wal.log")
 	l := writeRecords(t, final, "old-1", "old-2")
@@ -411,8 +411,12 @@ func TestWriterCommitAsIsAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	size := w.Size()
-	if err := w.CommitAs(final); err != nil {
+	installed, err := w.Install(final)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !installed {
+		t.Fatal("Install reported the rename did not happen, but returned no error")
 	}
 
 	recs, res, err := collect(t, final)
