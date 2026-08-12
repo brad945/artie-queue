@@ -600,7 +600,13 @@ function updateMsgCard(el, m) {
   el.querySelector(".task").textContent = taskName(m.payload);
   el.querySelector(".seq").textContent = "#" + m.seq;
   const att = el.querySelector(".attempts");
-  att.textContent = m.attempts > 0 ? `attempt ${m.attempts + 1}` : "";
+  // A live message is labelled with the delivery it is *about* to get; a
+  // dead-lettered one has no next attempt, so it gets a total instead.
+  if (m.state === "dead") {
+    att.textContent = m.attempts > 0 ? `${m.attempts} attempts, exhausted` : "";
+  } else {
+    att.textContent = m.attempts > 0 ? `attempt ${m.attempts + 1}` : "";
+  }
   att.className = "attempts" + (m.attempts > 0 ? " badge attempts" : "");
   el._state = m.state;
   el._created = Date.parse(m.created_at);
