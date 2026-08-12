@@ -96,33 +96,44 @@ func Replay(path string, fn func(Record) error) (ReplayResult, error) {
 			return res, fmt.Errorf("wal: reading header at %d in %s: %w", off, path, err)
 		}
 		length := int64(binary.LittleEndian.Uint32(hdr[0:4]))
-		want := binary.LittleEndian.Uint32(hdr[4:8])
+		wantHeader := binary.LittleEndian.Uint32(hdr[5:9])
+		wantRecord := binary.LittleEndian.Uint32(hdr[9:13])
 
-		if length > remaining-HeaderSize {
-			// The record claims more bytes than the file has left. Whether the
-			// length field itself was half-written or the payload was, the
-			// conclusion is the same: this record never finished being written.
-			res.ValidBytes = off
-			res.Torn = &TornTail{Offset: off, Bytes: remaining}
-			return res, nil
+		// Verify the framing before trusting the length. A damaged header is
+		// corruption; only a header that checks out earns the benefit of the
+		// doubt that follows.
+		if got := headerChecksum(hdr[:]); got != wantHeader {
+			return res, &CorruptionError{Path: path, Offset: off,
+				Reason: fmt.Sprintf("record header checksum mismatch (header says %#08x, computed %#08x); "+
+					"the length or type field is damaged, so the framing of everything after this point is unknown",
+					wantHeader, got)}
 		}
 		if length > MaxRecordSize {
 			return res, &CorruptionError{Path: path, Offset: off,
 				Reason: fmt.Sprintf("record length %d exceeds maximum %d", length, MaxRecordSize)}
+		}
+		if length > remaining-HeaderSize {
+			// The header is intact, so this length is what the writer meant.
+			// The file simply ends before the payload does: the write was
+			// interrupted. Safe to discard — the batch was never fsynced, so
+			// no client was told it committed.
+			res.ValidBytes = off
+			res.Torn = &TornTail{Offset: off, Bytes: remaining}
+			return res, nil
 		}
 
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(br, payload); err != nil {
 			return res, fmt.Errorf("wal: reading payload at %d in %s: %w", off, path, err)
 		}
-		if got := checksum(hdr[:], payload); got != want {
+		if got := recordChecksum(hdr[:], payload); got != wantRecord {
 			return res, &CorruptionError{Path: path, Offset: off,
-				Reason: fmt.Sprintf("checksum mismatch (header says %#08x, computed %#08x over %d payload bytes)", want, got, length)}
+				Reason: fmt.Sprintf("checksum mismatch (header says %#08x, computed %#08x over %d payload bytes)", wantRecord, got, length)}
 		}
-		t := Type(hdr[8])
+		t := Type(hdr[4])
 		if !t.valid() {
 			return res, &CorruptionError{Path: path, Offset: off,
-				Reason: fmt.Sprintf("unknown record type %d", hdr[8])}
+				Reason: fmt.Sprintf("unknown record type %d", hdr[4])}
 		}
 
 		if err := fn(Record{Type: t, Payload: payload, Offset: off}); err != nil {

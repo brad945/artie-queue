@@ -5,13 +5,32 @@
 //
 // Record framing:
 //
-//	[4B length][4B crc32c][1B type][payload]
+//	[4B length][1B type][4B header crc32c][4B record crc32c][payload]
 //
-// The CRC covers the length field, the type byte, and the payload. Covering
-// the length matters: the length is what tells the reader where the *next*
-// record begins, so a flipped bit there would silently re-frame the entire
-// remainder of the log. Checksumming it turns undetectable mis-framing into a
-// detected corruption at a known offset.
+// Two checksums, not one, and the reason is the whole corruption policy.
+//
+// The record CRC covers length, type and payload — it catches bit rot anywhere
+// in the record, including in the length field, which is what tells the reader
+// where the *next* record begins. Without that, one flipped bit would silently
+// re-frame the entire remainder of the log.
+//
+// But the record CRC can only be checked after reading `length` bytes, and the
+// interesting failure is precisely when `length` is the thing that got
+// corrupted: a garbage length runs past the end of the file, which is
+// indistinguishable from a write that was interrupted part-way — a torn tail.
+// Treating that as torn means truncating, which would throw away every valid
+// record after it, with nothing but a warning. That is the silent data loss
+// this whole design exists to prevent.
+//
+// So the header carries its own checksum, verifiable before the payload is
+// read. It splits the ambiguous case cleanly:
+//
+//	header CRC ok, length runs past EOF -> the header committed and the payload
+//	                                       did not: a genuine torn tail
+//	header CRC bad                      -> the framing itself is damaged: real
+//	                                       corruption, refuse to start
+//
+// Four extra bytes per record to turn "probably fine" into "known".
 package wal
 
 import (
@@ -73,8 +92,8 @@ func (t Type) valid() bool {
 }
 
 const (
-	// HeaderSize is length(4) + crc(4) + type(1).
-	HeaderSize = 9
+	// HeaderSize is length(4) + type(1) + header crc(4) + record crc(4).
+	HeaderSize = 13
 
 	// MaxRecordSize bounds a single payload. A corrupt length field would
 	// otherwise convince the reader to allocate an arbitrary amount of memory
@@ -103,20 +122,22 @@ func EncodedLen(payload []byte) int { return HeaderSize + len(payload) }
 func Encode(dst []byte, t Type, payload []byte) []byte {
 	var hdr [HeaderSize]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], uint32(len(payload)))
-	hdr[8] = byte(t)
-
-	crc := crc32.Update(0, crcTable, hdr[0:4])
-	crc = crc32.Update(crc, crcTable, hdr[8:9])
-	crc = crc32.Update(crc, crcTable, payload)
-	binary.LittleEndian.PutUint32(hdr[4:8], crc)
+	hdr[4] = byte(t)
+	binary.LittleEndian.PutUint32(hdr[5:9], headerChecksum(hdr[:]))
+	binary.LittleEndian.PutUint32(hdr[9:13], recordChecksum(hdr[:], payload))
 
 	dst = append(dst, hdr[:]...)
 	return append(dst, payload...)
 }
 
-// checksum recomputes the CRC for a record given its raw header and payload.
-func checksum(hdr []byte, payload []byte) uint32 {
-	crc := crc32.Update(0, crcTable, hdr[0:4])
-	crc = crc32.Update(crc, crcTable, hdr[8:9])
+// headerChecksum covers the framing fields only — length and type — so it can
+// be verified before trusting length enough to read the payload.
+func headerChecksum(hdr []byte) uint32 {
+	return crc32.Checksum(hdr[0:5], crcTable)
+}
+
+// recordChecksum covers the framing fields and the payload.
+func recordChecksum(hdr []byte, payload []byte) uint32 {
+	crc := crc32.Update(0, crcTable, hdr[0:5])
 	return crc32.Update(crc, crcTable, payload)
 }

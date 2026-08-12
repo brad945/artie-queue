@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"bytes"
 	"fmt"
 	"net/http"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/brad945/artie-queue/internal/wal"
 )
 
 // The single most important test in the repo.
@@ -351,8 +354,10 @@ func TestServerTruncatesTornTailAndStarts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A plausible header claiming a payload that is not there.
-	if _, err := f.Write([]byte{0x40, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x02, 0x01, 0x02}); err != nil {
+	// A well-formed record header — correct header checksum — whose payload
+	// was never written. This is what an interrupted write leaves behind.
+	full := wal.Encode(nil, wal.TypeEnqueue, bytes.Repeat([]byte("x"), 48))
+	if _, err := f.Write(full[:wal.HeaderSize+2]); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()

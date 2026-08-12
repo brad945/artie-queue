@@ -99,7 +99,10 @@ func TestEmptyAndMissingLog(t *testing.T) {
 // the record cannot be complete, and no client was ever told it committed, so
 // startup truncates and carries on.
 func TestTornTailIsTruncated(t *testing.T) {
-	for _, cut := range []int{1, 5, HeaderSize, HeaderSize + 2} {
+	// Cut points below HeaderSize leave a partial header; at or above it leave
+	// an intact header whose payload never arrived. Both are torn tails, and
+	// they exercise different branches of the reader.
+	for _, cut := range []int{1, 5, 9, HeaderSize, HeaderSize + 2} {
 		t.Run(fmt.Sprintf("partial-%d-bytes", cut), func(t *testing.T) {
 			path := tempLog(t)
 			l := writeRecords(t, path, "alpha", "beta")
@@ -249,6 +252,44 @@ func TestCorruptLengthFieldIsDetected(t *testing.T) {
 	}
 	if ce.Offset != target {
 		t.Errorf("offset = %d, want %d", ce.Offset, target)
+	}
+}
+
+// Regression test for the nastiest case in the format.
+//
+// Corrupt a length field so the record claims to run past the end of the file.
+// With only a whole-record checksum that is indistinguishable from a torn
+// write, so the reader would truncate — silently discarding every valid,
+// already-acknowledged record behind it and reporting only a warning. The
+// header checksum is what makes this detectable: the framing is damaged, so it
+// is corruption, not a crash artifact.
+func TestInflatedLengthIsCorruptionNotATornTail(t *testing.T) {
+	path := tempLog(t)
+	l := writeRecords(t, path, "alpha", "beta", "gamma", "delta", "epsilon")
+	l.Close()
+
+	recs, _, err := collect(t, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := recs[2].Offset
+
+	data, _ := os.ReadFile(path)
+	// Inflate the high byte of the length field: now it runs past EOF.
+	data[target+3] = 0xff
+	os.WriteFile(path, data, 0o644)
+
+	recs, res, err := collect(t, path)
+	var ce *CorruptionError
+	if !errors.As(err, &ce) {
+		t.Fatalf("a corrupt length that overruns the file must be reported as corruption, got err=%v torn=%+v after %d records",
+			err, res.Torn, len(recs))
+	}
+	if ce.Offset != target {
+		t.Errorf("offset = %d, want %d", ce.Offset, target)
+	}
+	if res.Torn != nil {
+		t.Errorf("must not be reported as a torn tail: %+v", res.Torn)
 	}
 }
 

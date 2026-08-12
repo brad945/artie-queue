@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>artie-queue · composable queue demo</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #13161b;
+    --panel-2: #191d24;
+    --line: #262c36;
+    --text: #e6e9ee;
+    --dim: #8b95a5;
+    --dimmer: #5d6675;
+    --accent: #5eead4;
+    --ready: #5eead4;
+    --delayed: #a78bfa;
+    --inflight: #fbbf24;
+    --done: #4ade80;
+    --dead: #f87171;
+    --p0: #64748b; --p1: #38bdf8; --p2: #a78bfa; --p3: #fb923c; --p4: #f43f5e;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  a { color: var(--accent); }
+  h1 { font-size: 16px; margin: 0; letter-spacing: -0.01em; }
+  h2 { font-size: 11px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: .09em; color: var(--dim); font-weight: 600; }
+  code, .mono { font-family: var(--mono); }
+
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 20;
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand .sub { color: var(--dimmer); font-size: 12px; }
+  .spacer { flex: 1; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px;
+    border-radius: 999px; border: 1px solid var(--line); font-size: 12px; background: var(--panel-2);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--done); }
+  .dot.bad { background: var(--dead); }
+  .dot.warn { background: var(--inflight); }
+
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; padding: 10px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .tab {
+    padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-2);
+    color: var(--dim); cursor: pointer; font-size: 12.5px; display: flex; align-items: center; gap: 8px;
+  }
+  .tab:hover { border-color: var(--dimmer); color: var(--text); }
+  .tab.active { border-color: var(--accent); color: var(--text); background: #0f2b28; }
+  .tab .depth { font-family: var(--mono); font-size: 11px; color: var(--dimmer); }
+  .tab.active .depth { color: var(--accent); }
+  .comparator {
+    margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--dim);
+    padding: 6px 12px; border: 1px dashed var(--line); border-radius: 8px;
+  }
+  .comparator b { color: var(--accent); font-weight: 500; }
+
+  main { display: grid; grid-template-columns: 288px 1fr; gap: 16px; padding: 16px 20px 40px; align-items: start; }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  .panel + .panel { margin-top: 14px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .tile .k { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--dim); }
+  .tile .v { font-family: var(--mono); font-size: 21px; margin-top: 2px; }
+  .tile .s { font-size: 11px; color: var(--dimmer); font-family: var(--mono); }
+  .tile.ready .v { color: var(--ready); }
+  .tile.delayed .v { color: var(--delayed); }
+  .tile.inflight .v { color: var(--inflight); }
+  .tile.dead .v { color: var(--dead); }
+  .tile.done .v { color: var(--done); }
+
+  .board { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+  @media (max-width: 1400px) { .board { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 800px) { .board { grid-template-columns: 1fr; } }
+  .col { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px; min-height: 220px; }
+  .col header {
+    all: unset; display: flex; align-items: center; justify-content: space-between;
+    padding: 2px 4px 10px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim);
+  }
+  .col .count { font-family: var(--mono); font-size: 12px; }
+  .col.ready header { color: var(--ready); }
+  .col.delayed header { color: var(--delayed); }
+  .col.inflight header { color: var(--inflight); }
+  .col.done header { color: var(--done); }
+  .col.dead header { color: var(--dead); }
+  .cards { display: flex; flex-direction: column; gap: 6px; max-height: 460px; overflow-y: auto; }
+  .cards::-webkit-scrollbar { width: 6px; }
+  .cards::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+
+  .card {
+    background: var(--panel-2); border: 1px solid var(--line); border-left-width: 3px;
+    border-radius: 7px; padding: 7px 9px; font-size: 12px;
+    animation: pop .22s ease-out;
+  }
+  @keyframes pop { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: none; } }
+  .card .row1 { display: flex; align-items: center; gap: 6px; }
+  .card .task { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .seq { font-family: var(--mono); font-size: 10.5px; color: var(--dimmer); }
+  .card .row2 { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 10.5px; color: var(--dimmer); font-family: var(--mono); }
+  .badge { font-family: var(--mono); font-size: 10px; padding: 1px 5px; border-radius: 4px; background: #0006; border: 1px solid var(--line); }
+  .badge.attempts { color: var(--inflight); border-color: #4a3a12; }
+  .bar { height: 3px; background: #0006; border-radius: 2px; margin-top: 6px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0%; border-radius: 2px; transition: width .2s linear; }
+
+  label.field { display: block; margin-bottom: 10px; font-size: 12px; color: var(--dim); }
+  label.field .lv { float: right; font-family: var(--mono); color: var(--text); }
+  input[type=range] { width: 100%; accent-color: var(--accent); margin-top: 4px; }
+  input[type=number], input[type=text], select {
+    width: 100%; background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 7px; padding: 6px 8px; font-family: var(--mono); font-size: 12px; margin-top: 4px;
+  }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  button {
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 8px; padding: 7px 11px; cursor: pointer; font-size: 12.5px; width: 100%;
+  }
+  button:hover { border-color: var(--dimmer); }
+  button.primary { background: #0f2b28; border-color: var(--accent); color: var(--accent); }
+  button.danger { background: #2a1113; border-color: #7f1d1d; color: #fca5a5; }
+  button.warn { background: #2a2110; border-color: #78350f; color: #fcd34d; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .btnrow { display: flex; gap: 8px; margin-top: 8px; }
+
+  .kv { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 0; border-bottom: 1px dotted #ffffff0d; }
+  .kv:last-child { border-bottom: 0; }
+  .kv .k { color: var(--dim); }
+  .kv .v { font-family: var(--mono); }
+
+  .logbox {
+    background: #08090c; border: 1px solid var(--line); border-radius: 8px; padding: 8px;
+    font-family: var(--mono); font-size: 11px; line-height: 1.55; color: var(--dim);
+    max-height: 190px; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+  }
+  .logbox .warnline { color: var(--inflight); }
+  .logbox .badline { color: var(--dead); }
+  .note { font-size: 11.5px; color: var(--dimmer); line-height: 1.5; margin-top: 8px; }
+  .result { margin-top: 10px; font-size: 12px; border-radius: 8px; padding: 10px; border: 1px solid var(--line); background: var(--panel-2); }
+  .result.bad { border-color: #7f1d1d; background: #1c0f11; }
+  .result.good { border-color: #14532d; background: #0d1a12; }
+  .result .head { font-weight: 600; margin-bottom: 4px; }
+  .hidden { display: none; }
+  .offline-banner { background: #2a1113; border: 1px solid #7f1d1d; color: #fca5a5; padding: 8px 12px; border-radius: 8px; margin-bottom: 14px; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <h1>artie-queue</h1>
+    <span class="sub">one comparator · two heaps · one append-only log</span>
+  </div>
+  <div class="spacer"></div>
+  <span class="pill" id="serverPill"><span class="dot" id="serverDot"></span><span id="serverText">queue server</span></span>
+  <span class="pill mono" id="fsyncPill">— records/fsync</span>
+</header>
+
+<div class="tabs" id="tabs"></div>
+
+<main>
+  <!-- ------------------------------------------------------------------ -->
+  <div>
+    <div class="panel">
+      <h2>Submit jobs</h2>
+      <div class="grid2">
+        <label class="field">count
+          <input type="number" id="count" value="12" min="1" max="500">
+        </label>
+        <label class="field">priority
+          <select id="priority">
+            <option value="-1">mixed 0–4</option>
+            <option value="0">0 · lowest</option>
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4 · highest</option>
+          </select>
+        </label>
+      </div>
+      <label class="field">delay before visible (ms)
+        <input type="number" id="delay" value="0" min="0" step="500">
+      </label>
+      <button class="primary" onclick="submitJobs()">Submit</button>
+      <div class="btnrow">
+        <button onclick="quick(8, -1, 0)">8 now</button>
+        <button onclick="quick(6, -1, 5000)">6 in 5s</button>
+      </div>
+
+      <h2 style="margin-top:16px">Idempotent enqueue</h2>
+      <label class="field">dedup id
+        <input type="text" id="dedupId" value="invoice-1001" spellcheck="false">
+      </label>
+      <button onclick="submitDup()">Submit twice with this id</button>
+      <div class="note">A producer that retries after a timeout gets 200 and the <em>original</em> message id back — not a duplicate, and not an error to special-case.</div>
+      <div id="dupResult"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Worker pool</h2>
+      <label class="field">workers <span class="lv" id="workersV">4</span>
+        <input type="range" id="workers" min="0" max="16" value="4" oninput="pushConfig()">
+      </label>
+      <label class="field">failure rate (nack) <span class="lv" id="failureV">15%</span>
+        <input type="range" id="failure" min="0" max="100" value="15" oninput="pushConfig()">
+      </label>
+      <label class="field">abandon rate (never ack) <span class="lv" id="abandonV">5%</span>
+        <input type="range" id="abandon" min="0" max="100" value="5" oninput="pushConfig()">
+      </label>
+      <label class="field">visibility timeout <span class="lv" id="visV">4000ms</span>
+        <input type="range" id="vis" min="500" max="15000" step="500" value="4000" oninput="pushConfig()">
+      </label>
+      <div class="note">Abandoned jobs are never acked, so the lease expires and the queue redelivers with <code>attempts+1</code>. After 4 attempts they dead-letter.</div>
+    </div>
+
+    <div class="panel">
+      <h2>Durability</h2>
+      <div class="kv"><span class="k">log size</span><span class="v" id="logSize">—</span></div>
+      <div class="kv"><span class="k">records</span><span class="v" id="logRecords">—</span></div>
+      <div class="kv"><span class="k">fsyncs</span><span class="v" id="logFsyncs">—</span></div>
+      <div class="kv"><span class="k">records / fsync</span><span class="v" id="logRPF">—</span></div>
+      <div class="kv"><span class="k">last fsync</span><span class="v" id="logLast">—</span></div>
+      <div class="kv"><span class="k">avg fsync</span><span class="v" id="logAvg">—</span></div>
+      <div class="btnrow">
+        <button onclick="burst()">Burst 300</button>
+        <button onclick="compact()">Compact</button>
+      </div>
+      <div class="note">Every enqueue is fsynced before its 201. Concurrent enqueues share one fsync — burst and watch records/fsync climb while the guarantee stays identical.</div>
+      <div id="burstResult"></div>
+    </div>
+  </div>
+
+  <!-- ------------------------------------------------------------------ -->
+  <div>
+    <div id="offlineBanner" class="offline-banner hidden">
+      The queue server is not running. Workers are erroring; nothing is being lost. Restart it from the crash lab below.
+    </div>
+
+    <div class="tiles">
+      <div class="tile ready"><div class="k">ready</div><div class="v" id="tReady">0</div></div>
+      <div class="tile delayed"><div class="k">delayed</div><div class="v" id="tDelayed">0</div></div>
+      <div class="tile inflight"><div class="k">in flight</div><div class="v" id="tInflight">0</div></div>
+      <div class="tile dead"><div class="k">dead-letter</div><div class="v" id="tDead">0</div></div>
+      <div class="tile done"><div class="k">completed</div><div class="v" id="tDone">0</div><div class="s" id="tDoneSub">—</div></div>
+      <div class="tile"><div class="k">oldest age</div><div class="v" id="tOldest">—</div></div>
+      <div class="tile"><div class="k">redelivered</div><div class="v" id="tRedeliver">0</div><div class="s">lease expiries</div></div>
+    </div>
+
+    <div class="board">
+      <div class="col delayed">
+        <header>delayed <span class="count" id="cDelayed">0</span></header>
+        <div class="cards" id="colDelayed"></div>
+      </div>
+      <div class="col ready">
+        <header>ready <span class="count" id="cReady">0</span></header>
+        <div class="cards" id="colReady"></div>
+      </div>
+      <div class="col inflight">
+        <header>in flight <span class="count" id="cInflight">0</span></header>
+        <div class="cards" id="colInflight"></div>
+      </div>
+      <div class="col done">
+        <header>completed <span class="count" id="cDone">0</span></header>
+        <div class="cards" id="colDone"></div>
+      </div>
+      <div class="col dead">
+        <header>dead-letter <span class="count" id="cDead">0</span></header>
+        <div class="cards" id="colDead"></div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:14px">
+      <h2>Workers</h2>
+      <div class="cards" id="workerList" style="flex-direction:row; flex-wrap:wrap; max-height:none"></div>
+    </div>
+
+    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:14px; margin-top:14px" id="labGrid">
+      <div class="panel">
+        <h2>Crash lab</h2>
+        <div class="note" style="margin-top:0">
+          SIGKILL to the real queue process — no shutdown hook, no flush. Everything that was confirmed is on disk or it is gone.
+        </div>
+        <div class="btnrow">
+          <button class="danger" id="killBtn" onclick="killServer()">kill -9</button>
+          <button class="primary" id="startBtn" onclick="startServer()">Restart &amp; replay</button>
+        </div>
+        <div id="crashResult"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Corruption lab</h2>
+        <div class="note" style="margin-top:0">
+          Damage the log on purpose and watch the startup policy decide. A torn tail is a crash artifact; a bad checksum is data loss.
+        </div>
+        <div class="btnrow">
+          <button class="warn" onclick="corrupt('tail')">Torn tail</button>
+          <button class="danger" onclick="corrupt('midlog')">Flip a byte mid-log</button>
+        </div>
+        <div class="btnrow">
+          <button onclick="repair()">Run operator repair</button>
+        </div>
+        <div id="labResult"></div>
+      </div>
+    </div>
+
+    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:14px; margin-top:14px">
+      <div class="panel">
+        <h2>Demo activity</h2>
+        <div class="logbox" id="events"></div>
+      </div>
+      <div class="panel">
+        <h2>Queue server log</h2>
+        <div class="logbox" id="serverLog"></div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+let snap = null;          // latest snapshot
+let clockSkew = 0;        // browser now - server now
+let userTouching = false; // don't fight the user's slider
+
+const $ = (id) => document.getElementById(id);
+
+// ---------------------------------------------------------------- stream
+const es = new EventSource("/api/stream");
+es.onmessage = (ev) => {
+  snap = JSON.parse(ev.data);
+  clockSkew = Date.now() - snap.time_ms;
+  render(snap);
+};
+
+// ---------------------------------------------------------------- helpers
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body || {}),
+  });
+  return r.json();
+}
+const esc = (s) => String(s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const bytes = (n) => n >= 1048576 ? (n/1048576).toFixed(1)+" MiB" : n >= 1024 ? (n/1024).toFixed(1)+" KiB" : n+" B";
+const serverNow = () => Date.now() - clockSkew;
+
+// ---------------------------------------------------------------- controls
+async function submitJobs() {
+  await post("/api/submit", {
+    count: +$("count").value,
+    priority: +$("priority").value,
+    delay_ms: +$("delay").value,
+  });
+}
+async function quick(count, priority, delay) {
+  await post("/api/submit", {count, priority, delay_ms: delay});
+}
+async function submitDup() {
+  const id = $("dedupId").value.trim();
+  if (!id) return;
+  const a = await post("/api/submit", {count: 1, priority: 3, dedup_id: id});
+  const b = await post("/api/submit", {count: 1, priority: 3, dedup_id: id});
+  const first = (a.results || [{}])[0], second = (b.results || [{}])[0];
+  $("dupResult").innerHTML =
+    `<div class="result ${second.duplicate ? "good" : "bad"}">
+       <div class="head">${second.duplicate ? "second enqueue rejected as a duplicate" : "second enqueue was accepted"}</div>
+       <div class="mono" style="font-size:11px;color:var(--dim)">
+         1st → ${esc(first.id || "?")} (seq ${first.seq ?? "?"})<br>
+         2nd → ${esc(second.id || "?")} ${second.duplicate ? "· same id, no new message" : ""}
+       </div>
+     </div>`;
+}
+function pushConfig() {
+  $("workersV").textContent = $("workers").value;
+  $("failureV").textContent = $("failure").value + "%";
+  $("abandonV").textContent = $("abandon").value + "%";
+  $("visV").textContent = $("vis").value + "ms";
+  userTouching = true;
+  clearTimeout(pushConfig.t);
+  pushConfig.t = setTimeout(async () => {
+    await post("/api/config", {
+      workers: +$("workers").value,
+      failure_rate: +$("failure").value / 100,
+      abandon_rate: +$("abandon").value / 100,
+      visibility_ms: +$("vis").value,
+    });
+    userTouching = false;
+  }, 120);
+}
+async function selectQueue(name) {
+  await post("/api/config", {target: name});
+}
+async function burst() {
+  $("burstResult").innerHTML = `<div class="result">running…</div>`;
+  const r = await post("/api/burst", {count: 300, concurrency: 48});
+  $("burstResult").innerHTML =
+    `<div class="result good">
+       <div class="head">${r.enqueued} durable enqueues in ${r.elapsed_ms}ms</div>
+       <div class="mono" style="font-size:11px;color:var(--dim)">
+         ${Math.round(r.per_second || 0).toLocaleString()} enqueues/sec, every one fsynced before its response
+       </div>
+     </div>`;
+}
+async function compact() {
+  const r = await post("/api/compact", {});
+  if (r.error) { $("burstResult").innerHTML = `<div class="result bad">${esc(r.error)}</div>`; return; }
+  $("burstResult").innerHTML =
+    `<div class="result good">
+       <div class="head">log compacted</div>
+       <div class="mono" style="font-size:11px;color:var(--dim)">
+         ${bytes(r.before_bytes)} → ${bytes(r.after_bytes)} · snapshot written, fsynced, renamed atomically
+       </div>
+     </div>`;
+}
+
+// ---------------------------------------------------------------- labs
+let preCrash = null;
+async function killServer() {
+  const before = snap && snap.stats ? snap.stats : null;
+  const r = await post("/api/server/kill", {});
+  if (r.error) { $("crashResult").innerHTML = `<div class="result bad">${esc(r.error)}</div>`; return; }
+  preCrash = r.stats_before || before;
+  $("crashResult").innerHTML =
+    `<div class="result bad">
+       <div class="head">killed</div>
+       <div class="mono" style="font-size:11px;color:var(--dim)">
+         held ${preCrash ? preCrash.total : "?"} messages
+         (${preCrash ? preCrash.ready : "?"} ready, ${preCrash ? preCrash.in_flight : "?"} leased, ${preCrash ? preCrash.dlq : "?"} dead-lettered)<br>
+         nothing was flushed on the way out
+       </div>
+     </div>`;
+}
+async function startServer() {
+  $("crashResult").innerHTML = `<div class="result">restarting and replaying the log…</div>`;
+  const r = await post("/api/server/start", {});
+  if (!r.started) {
+    $("crashResult").innerHTML = `<div class="result bad"><div class="head">refused to start</div>
+      <div class="mono" style="font-size:11px">${esc(r.error || "")}</div></div>`;
+    return;
+  }
+  setTimeout(() => {
+    const now = snap && snap.stats ? snap.stats : null;
+    const b = preCrash;
+    $("crashResult").innerHTML =
+      `<div class="result good">
+         <div class="head">recovered from the log</div>
+         <div class="mono" style="font-size:11px;color:var(--dim)">
+           ${b ? b.total : "?"} messages before the kill → ${now ? now.total : "?"} after replay<br>
+           leases did not survive (by design): ${b ? b.in_flight : "?"} in flight → ${now ? now.in_flight : "?"}, all back to ready
+         </div>
+       </div>`;
+  }, 700);
+}
+async function corrupt(mode) {
+  $("labResult").innerHTML = `<div class="result">corrupting the log and restarting…</div>`;
+  const r = await post("/api/lab/corrupt", {mode});
+  if (r.error && !r.what) { $("labResult").innerHTML = `<div class="result bad">${esc(r.error)}</div>`; return; }
+  const refused = !r.started;
+  $("labResult").innerHTML =
+    `<div class="result ${refused ? "bad" : "good"}">
+       <div class="head">${refused ? "startup refused" : "torn tail truncated, server started"}</div>
+       <div class="mono" style="font-size:11px;color:var(--dim);margin-bottom:6px">${esc(r.what || "")}</div>
+       <div style="color:var(--text);font-size:11.5px;margin-bottom:6px">${esc(r.explanation || "")}</div>
+       <div class="logbox" style="max-height:110px">${esc((r.verify || "").trim() || (r.error || ""))}</div>
+     </div>`;
+}
+async function repair() {
+  $("labResult").innerHTML = `<div class="result">running repair…</div>`;
+  const r = await post("/api/lab/repair", {});
+  if (r.error) { $("labResult").innerHTML = `<div class="result bad">${esc(r.error)}</div>`; return; }
+  $("labResult").innerHTML =
+    `<div class="result good">
+       <div class="head">repaired and restarted</div>
+       <div class="logbox" style="max-height:110px">${esc((r.output || "").trim())}</div>
+     </div>`;
+}
+
+// ---------------------------------------------------------------- rendering
+function render(s) {
+  // server pill
+  const running = s.server.running;
+  $("serverDot").className = "dot" + (running ? "" : " bad");
+  $("serverText").textContent = running
+    ? (s.server.managed ? "queue server up" : "queue server (external)")
+    : "queue server down";
+  $("offlineBanner").classList.toggle("hidden", running);
+  $("killBtn").disabled = !s.server.managed || !running;
+  $("startBtn").disabled = !s.server.managed || running;
+  if (!s.server.managed) $("labGrid").style.opacity = ".5";
+
+  renderTabs(s);
+
+  const st = s.stats;
+  if (st) {
+    $("tReady").textContent = st.ready;
+    $("tDelayed").textContent = st.delayed;
+    $("tInflight").textContent = st.in_flight;
+    $("tDead").textContent = st.dlq;
+    $("tOldest").textContent = st.oldest_age_ms ? (st.oldest_age_ms/1000).toFixed(1)+"s" : "—";
+    $("tRedeliver").textContent = st.counters.lease_expired + st.counters.nacked;
+    $("cReady").textContent = st.ready;
+    $("cDelayed").textContent = st.delayed;
+    $("cInflight").textContent = st.in_flight;
+    $("cDead").textContent = st.dlq;
+
+    const L = st.log;
+    $("logSize").textContent = bytes(L.size_bytes);
+    $("logRecords").textContent = L.records.toLocaleString();
+    $("logFsyncs").textContent = L.fsyncs.toLocaleString();
+    $("logRPF").textContent = L.records_per_fsync.toFixed(2);
+    $("logLast").textContent = L.last_sync_us + "µs";
+    $("logAvg").textContent = L.avg_sync_us + "µs";
+    $("fsyncPill").textContent = L.records_per_fsync.toFixed(1) + " records/fsync";
+  }
+
+  const r = s.runner;
+  $("tDone").textContent = r.done;
+  $("tDoneSub").textContent = `${r.failed} failed · ${r.abandoned} abandoned`;
+  $("cDone").textContent = r.recent.length;
+
+  if (!userTouching) {
+    $("workers").value = r.config.workers; $("workersV").textContent = r.config.workers;
+    $("failure").value = Math.round(r.config.failure_rate*100); $("failureV").textContent = Math.round(r.config.failure_rate*100)+"%";
+    $("abandon").value = Math.round(r.config.abandon_rate*100); $("abandonV").textContent = Math.round(r.config.abandon_rate*100)+"%";
+    $("vis").value = r.config.visibility_ms; $("visV").textContent = r.config.visibility_ms+"ms";
+  }
+
+  const peek = s.peek || {};
+  keyed($("colDelayed"), peek.delayed || [], msgCard, updateMsgCard);
+  keyed($("colReady"), peek.ready || [], msgCard, updateMsgCard);
+  keyed($("colInflight"), peek.in_flight || [], msgCard, updateMsgCard);
+  keyed($("colDead"), peek.dlq || [], msgCard, updateMsgCard);
+  renderDone(r.recent);
+  renderWorkers(r.workers);
+
+  $("events").innerHTML = (s.events || []).slice(-40).reverse().map(l => `<div>${esc(l)}</div>`).join("");
+  $("serverLog").innerHTML = (s.server.logs || []).slice(-60).reverse().map(l => {
+    const cls = /REFUS|FATAL|corrupt/.test(l) ? "badline" : /WARN|torn/.test(l) ? "warnline" : "";
+    return `<div class="${cls}">${esc(l)}</div>`;
+  }).join("");
+}
+
+function renderTabs(s) {
+  const el = $("tabs");
+  const depths = {};
+  if (s.queues && s.queues.queues) for (const q of s.queues.queues) depths[q.name] = q;
+  if (el.dataset.built !== "1") {
+    el.innerHTML = s.defs.map(d =>
+      `<div class="tab" data-name="${d.name}" onclick="selectQueue('${d.name}')">
+         <span>${esc(d.label)}</span><span class="depth" id="depth-${d.name}"></span>
+       </div>`).join("") + `<div class="comparator" id="comparator"></div>`;
+    el.dataset.built = "1";
+  }
+  for (const d of s.defs) {
+    const tab = el.querySelector(`[data-name="${d.name}"]`);
+    tab.classList.toggle("active", d.name === s.target);
+    const q = depths[d.name];
+    const dep = $("depth-" + d.name);
+    if (q) dep.textContent = `${q.ready + q.delayed + q.in_flight}`;
+  }
+  const def = s.defs.find(d => d.name === s.target);
+  if (def) $("comparator").innerHTML = `ready heap ordered by <b>${esc(def.comparator)}</b>`;
+}
+
+function msgCard(m) {
+  const el = document.createElement("div");
+  el.className = "card";
+  el.innerHTML =
+    `<div class="row1">
+       <span class="badge prio"></span>
+       <span class="task"></span>
+       <span class="seq"></span>
+     </div>
+     <div class="row2">
+       <span class="attempts"></span><span class="when"></span>
+     </div>
+     <div class="bar"><i></i></div>`;
+  updateMsgCard(el, m);
+  return el;
+}
+
+function updateMsgCard(el, m) {
+  const p = Math.max(0, Math.min(4, m.priority));
+  el.style.borderLeftColor = `var(--p${p})`;
+  const prio = el.querySelector(".prio");
+  prio.textContent = "p" + m.priority + (m.effective_priority !== m.priority ? `→${m.effective_priority}` : "");
+  prio.style.color = `var(--p${p})`;
+  el.querySelector(".task").textContent = taskName(m.payload);
+  el.querySelector(".seq").textContent = "#" + m.seq;
+  const att = el.querySelector(".attempts");
+  att.textContent = m.attempts > 0 ? `attempt ${m.attempts + 1}` : "";
+  att.className = "attempts" + (m.attempts > 0 ? " badge attempts" : "");
+  el._state = m.state;
+  el._created = Date.parse(m.created_at);
+  el._visible = Date.parse(m.visible_at);
+  el._deadline = m.deadline ? Date.parse(m.deadline) : 0;
+  const bar = el.querySelector(".bar");
+  bar.style.display = (m.state === "delayed" || m.state === "in_flight") ? "" : "none";
+}
+
+function taskName(payload) {
+  if (payload && typeof payload === "object" && payload.task) return payload.task;
+  if (typeof payload === "string") return payload;
+  return "job";
+}
+
+function renderDone(recent) {
+  const items = recent.slice().reverse();
+  const el = $("colDone");
+  el.innerHTML = items.map(c => {
+    const color = c.outcome === "done" ? "var(--done)" : c.outcome === "failed" ? "var(--inflight)" : "var(--dead)";
+    const label = c.outcome === "done" ? "acked" : c.outcome === "failed" ? "nacked" : "abandoned";
+    return `<div class="card" style="border-left-color:${color}">
+      <div class="row1">
+        <span class="badge" style="color:var(--p${Math.max(0,Math.min(4,c.priority))})">p${c.priority}</span>
+        <span class="task">${esc(c.task)}</span>
+        <span class="seq">#${c.seq}</span>
+      </div>
+      <div class="row2"><span style="color:${color}">${label}</span><span>worker ${c.worker}</span></div>
+    </div>`;
+  }).join("");
+}
+
+function renderWorkers(workers) {
+  $("workerList").innerHTML = workers.map(w => {
+    const busy = w.state === "working";
+    const color = busy ? "var(--inflight)" : w.state === "no server" ? "var(--dead)" : "var(--dimmer)";
+    return `<div class="card" style="width:170px;border-left-color:${color}"
+                 data-started="${w.started_ms||0}" data-total="${w.total_ms||0}">
+      <div class="row1"><span class="task">worker ${w.id}</span>
+        <span class="seq" style="color:${color}">${esc(w.state)}</span></div>
+      <div class="row2">${busy ? esc(w.task) + " · p" + w.priority : "&nbsp;"}</div>
+      ${busy ? `<div class="bar"><i style="background:var(--inflight)"></i></div>` : ""}
+    </div>`;
+  }).join("");
+}
+
+// keyed reconciliation so cards animate in and out instead of flashing.
+function keyed(container, items, make, update) {
+  const existing = new Map();
+  for (const child of Array.from(container.children)) existing.set(child.dataset.id, child);
+  const frag = document.createDocumentFragment();
+  for (const it of items) {
+    let node = existing.get(it.id);
+    if (node) { existing.delete(it.id); update(node, it); }
+    else { node = make(it); node.dataset.id = it.id; }
+    frag.appendChild(node);
+  }
+  for (const node of existing.values()) node.remove();
+  container.appendChild(frag);
+}
+
+// Progress bars tick locally between snapshots, against the server's clock.
+function tick() {
+  const now = serverNow();
+  for (const el of document.querySelectorAll(".cards .card")) {
+    const bar = el.querySelector(".bar > i");
+    if (!bar) continue;
+    if (el._state === "delayed" && el._visible) {
+      const span = el._visible - el._created;
+      const pct = span > 0 ? Math.max(0, Math.min(100, ((now - el._created) / span) * 100)) : 100;
+      bar.style.width = pct + "%";
+      bar.style.background = "var(--delayed)";
+    } else if (el._state === "in_flight" && el._deadline) {
+      const left = el._deadline - now;
+      const total = 4000;
+      const pct = Math.max(0, Math.min(100, (left / total) * 100));
+      bar.style.width = pct + "%";
+      bar.style.background = left < 1000 ? "var(--dead)" : "var(--inflight)";
+    }
+  }
+  for (const el of document.querySelectorAll("#workerList .card")) {
+    const bar = el.querySelector(".bar > i");
+    if (!bar) continue;
+    const started = +el.dataset.started, total = +el.dataset.total;
+    if (started && total) {
+      bar.style.width = Math.max(0, Math.min(100, ((Date.now() - started) / total) * 100)) + "%";
+    }
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
