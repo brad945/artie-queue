@@ -93,6 +93,18 @@ func (s *Supervisor) Start() error {
 		default:
 		}
 		if s.client.Healthy() {
+			// A healthy endpoint is not proof that *our* child is the one
+			// answering. If something else already owns the port, our child
+			// dies with "address already in use" while the stranger answers
+			// /healthz — and we would report success while supervising a
+			// corpse. Confirm the child is still alive before believing it.
+			time.Sleep(50 * time.Millisecond)
+			select {
+			case <-exited:
+				return fmt.Errorf("queue server exited even though %s answered: %s "+
+					"(another process is probably already listening there)", s.addr, s.lastLogLines(6))
+			default:
+			}
 			return nil
 		}
 		time.Sleep(25 * time.Millisecond)
