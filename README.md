@@ -1,0 +1,509 @@
+# artie-queue
+
+A persistent, composable HTTP queue in Go. FIFO or LIFO, priority, and delay —
+composed freely, so a *delayed priority-LIFO* queue is a configuration, not a
+feature.
+
+No database, no embedded KV store, no broker. Storage is an append-only log
+this repo implements, with group-commit fsync, crash recovery, and compaction.
+The only dependency is the Go standard library.
+
+```bash
+go build -o artie-queue ./cmd/artie-queue
+go run ./cmd/jobrunner              # supervises the server, serves the dashboard
+open http://localhost:8081
+```
+
+---
+
+## The one idea worth stealing
+
+Four features were asked for. Implementing four features would have been the
+wrong answer. There is **one ordered structure with a configurable
+comparator**, and every queue type falls out of it:
+
+```go
+func (c *Config) less(a, b *Message) bool {
+    if c.PriorityEnabled && a.effPriority != b.effPriority {
+        return a.effPriority > b.effPriority   // priority is primary
+    }
+    if c.Ordering == LIFO {
+        return a.Seq > b.Seq                   // mode tie-breaks within a level
+    }
+    return a.Seq < b.Seq
+}
+```
+
+| priority | mode | resulting queue |
+|---|---|---|
+| off | FIFO | plain FIFO |
+| off | LIFO | plain LIFO |
+| on  | FIFO | priority-FIFO |
+| on  | LIFO | priority-LIFO |
+
+Delay is not a fifth case. **Delay is a gate in front of the same comparator**:
+a message that is not yet visible simply isn't in the structure that `dequeue`
+looks at. So each row above is also its delayed variant, which is where the
+other two of the six types come from.
+
+That is the whole design. Everything below is about making it durable.
+
+---
+
+## Architecture
+
+```
+                    ┌──────────────────────────────────────────┐
+ POST /messages ───▶│ enqueue: assign Seq, append, apply       │
+                    │   ├── VisibleAt > now ──▶ delayed heap   │──┐
+                    │   └── otherwise ────────▶ ready heap     │  │ timer set to
+                    └──────────────────────────────────────────┘  │ next VisibleAt
+                                   │                              │
+ POST /dequeue ◀───────────────────┤◀─────────────────────────────┘
+                                   ▼
+                          in-flight (lease heap, by deadline)
+                                   │
+             ack ──▶ deleted       │       deadline passes ──▶ attempts+1
+             nack ─▶ requeued ◀────┘                     └──▶ attempts ≥ max ──▶ DLQ
+```
+
+**Two heaps, not one.** The delayed heap is ordered by `VisibleAt`; the ready
+heap by the comparator. A single timer, set to the next `VisibleAt`, promotes
+between them — no polling, and no scanning the ready heap for visibility.
+Scanning would be worse than slow: the top of a heap is the only element you
+can inspect in O(1), so "skip the invisible ones" degrades into a linear scan
+*and* stops the comparator being a total order over the heap's contents.
+
+**Everything is rebuilt from the log.** Both heaps, in-flight state, the DLQ,
+the dedup index and the sequence counter are derived state. The log is the
+database.
+
+### Layout
+
+| path | what |
+|---|---|
+| `internal/wal/` | record format, group-commit writer, replay, corruption policy |
+| `internal/queue/` | message model, comparator, heaps, leases, DLQ, dedup, compaction |
+| `internal/api/` | HTTP handlers (stdlib `ServeMux`, no router) |
+| `internal/demo/` | job runner, supervisor, dashboard |
+| `internal/integration/` | tests that SIGKILL the real server binary |
+
+---
+
+## The five design decisions
+
+### 1. Priority is primary; the ordering mode tie-breaks within a priority level
+
+In a priority-LIFO queue holding a priority-5 message and a newer priority-1
+message, **the priority-5 message comes out first**.
+
+The alternative — mode primary, priority as tie-breaker — is not a weaker
+choice, it is a *degenerate* one. `Seq` is monotonic and unique, so if the mode
+sorts first, every comparison is already decided before priority is consulted.
+The priority field would be dead configuration.
+
+The real cost of this choice is **starvation**: a steady stream of priority-5
+work means priority-1 messages never surface. So there is an optional
+`aging_interval_ms`, off by default, that raises a waiting message's *effective*
+priority one level per interval up to a cap.
+
+Aging has a subtlety worth naming: a comparator that reads the clock silently
+invalidates the heap, because the ordering between two elements can change
+while they sit in it and the invariant is only maintained at push and pop. So
+the boost is materialised into a stored field on a fixed tick and the heap is
+rebuilt in O(n) — the comparator stays a pure function of stored fields. It is
+off by default so that the ordering tests assert against a strict total order.
+
+### 2. Lease-and-ack, not pop-and-forget. 30s visibility, 5 attempts
+
+Dequeue moves a message to in-flight with a visibility deadline. The consumer
+must `ack` (delete) or `nack` (requeue immediately). If the deadline passes
+with neither, the message is redelivered with `Attempts+1`; once attempts reach
+`max_attempts` it is dead-lettered.
+
+**This is at-least-once delivery, and the consequence is that consumers must be
+idempotent.** Pop-and-forget would be simpler and would silently lose a message
+every time a consumer died mid-work, which is the wrong trade for anything that
+matters.
+
+Nack and lease-expiry are the same state transition — a delivery that did not
+succeed — differing only in cause, which the record type already captures.
+A requeued message keeps its original `Seq`, so it returns to its place in the
+ordering rather than to the back of the queue.
+
+### 3. Group commit: every enqueue is fsynced before its 201, and concurrent enqueues share one fsync
+
+The naive options are fsync-per-write (durable, pinned to the disk's serial
+fsync rate) or batch-and-respond-early (fast, loses the last few milliseconds
+on power loss). Group commit refuses the trade:
+
+```go
+batch, _ := log.Append(rec)   // buffer, under the queue mutex
+queue.mu.Unlock()             // release before waiting
+err := log.Wait(batch)        // one fsync serves every writer in this batch
+```
+
+A background flusher owns the file descriptor. While it is inside one fsync,
+every writer that arrives piles into the next batch and is committed together.
+Throughput scales with concurrency instead of being capped by fsync latency,
+and **no caller is ever told "committed" before the bytes are on the platter**.
+
+Appending happens under the queue mutex so that log order matches
+state-transition order; only the durability wait is outside it. That one rule
+is what makes replay reproduce exactly the state a crash interrupted.
+
+Measured on this laptop (Apple silicon, APFS): ~28 enqueues/sec/goroutine
+single-threaded, ~5,100/sec at 48 concurrent producers — with identical
+durability. The dashboard's **Burst** button shows the records-per-fsync number
+climbing live.
+
+There is **no per-message durability override**. Two durability stories in one
+queue is a worse product than one honest one, and "you can turn off safety"
+undercuts the entire pitch.
+
+A failed write or fsync is **fatal and sticky**: the queue stops accepting work
+and every subsequent call returns the error. We do not know what reached the
+disk, and accepting messages we cannot persist is the one thing worse than
+being unavailable.
+
+### 4. Corruption: a torn tail truncates, any bad checksum refuses to start
+
+| what replay finds | what happens |
+|---|---|
+| file ends inside a record, header intact | truncate, log a warning, start |
+| record header checksum mismatch | **refuse to start**, name the byte offset |
+| complete record, payload checksum mismatch — anywhere, including the last record | **refuse to start**, name the byte offset |
+| unrecognised record type | **refuse to start**, name the byte offset |
+
+**A record is never silently skipped.** A queue that quietly drops data it
+cannot read is worse than one that will not start, because only one of those
+two failures is visible to a human.
+
+The tail case is the interesting one. A *complete* record at the end of the log
+with a bad checksum is ambiguous — bit rot, or a torn write that happened to
+land on a record boundary. Refusing is the deliberate choice: guessing
+"probably torn" is exactly how a queue silently loses a record.
+
+#### Why records carry two checksums
+
+The format is:
+
+```
+[4B length][1B type][4B header crc32c][4B record crc32c][payload]
+```
+
+The record CRC covers length, type and payload. Covering the *length* matters,
+because the length is what tells the reader where the next record starts — one
+flipped bit there would silently re-frame the rest of the log.
+
+But the record CRC can only be verified *after* reading `length` bytes, and the
+nastiest failure is when `length` itself is what got corrupted: an inflated
+length runs past the end of the file, which looks exactly like an interrupted
+write. Treating that as a torn tail means truncating — throwing away every
+valid, already-acknowledged record behind it, with nothing but a warning.
+
+The header checksum is verifiable before `length` is trusted, and separates the
+two cases cleanly:
+
+- header CRC **ok**, length runs past EOF → the header committed and the
+  payload did not: a genuine torn tail, safe to discard, because the batch was
+  never fsynced and no client was ever told it committed.
+- header CRC **bad** → the framing is damaged: corruption, refuse.
+
+Four extra bytes per record to turn "probably fine" into "known". This was
+found by using the demo's corruption lab against the original single-checksum
+format, and there is a regression test for it
+(`TestInflatedLengthIsCorruptionNotATornTail`).
+
+#### The operator escape hatch
+
+Refusing to start is only reasonable if a human has a way forward, so
+truncation exists as an explicit, auditable command rather than a silent
+default:
+
+```console
+$ artie-queue verify -dir ./data
+FAIL  ./data/jobs/wal.log
+      wal: corrupt record in ./data/jobs/wal.log at byte offset 1311: checksum
+      mismatch (header says 0x81f9d3b8, computed 0x4c42f7df over 88 payload bytes)
+
+$ artie-queue repair -dir ./data -queue jobs -truncate-at 1311
+truncated ./data/jobs/wal.log from 2729 to 1311 bytes (1418 bytes discarded)
+original saved as ./data/jobs/wal.log.bak.1786518130660256000
+```
+
+`repair` always leaves the original behind. The point is that a person decided
+to drop the tail, not that the tool decided it was unimportant.
+
+### 5. Dedup on a client-supplied `DedupID`, 5-minute window, duplicates return 200
+
+A producer that retries after a timeout gets `200` with the **original message
+id**, not a `409`. It wants idempotence, not an error to special-case.
+
+The work is not the lookup — it is that the dedup index must be part of the log
+and rebuilt on replay, and must survive compaction, or it is theater the moment
+the process restarts. Live messages' entries are rebuilt from their own
+`ENQUEUE` records; entries whose message has already been acked (but whose
+window is still open) are written explicitly into the compaction snapshot as
+`DEDUP` records. Both paths are tested across a restart.
+
+---
+
+## The four questions
+
+### 1. How do you handle replay messages?
+
+Two different things share that name, and they get different answers.
+
+**(a) Redelivery.** A visibility deadline that passes without an ack causes
+redelivery with `Attempts+1`. That makes this at-least-once, so consumers must
+be idempotent. The queue helps on the *producer* side: `DedupID` makes a
+retried enqueue idempotent within a 5-minute window, which is exactly the
+situation a producer is in when a request times out and it cannot tell whether
+the enqueue committed. The crash test measures this directly — it tracks
+requests that were in flight when the process was killed as genuinely
+*unknown*, because that is what they are.
+
+The queue does **not** dedup on the consumer side. Delivering twice is a
+property of at-least-once, not a bug, and the honest fix is idempotent
+consumers rather than a broker pretending to offer exactly-once.
+
+**(b) Log replay.** Storage is an append-only log, so history is already there.
+Startup replays every record through the same `apply` functions the live write
+path uses — one implementation, two entry points, so a recovered queue cannot
+drift from a running one. Nothing stops a consumer resetting to an offset and
+re-reading history, which is the Kafka model, and which is exactly the bridge
+to the next question.
+
+### 2. How would you refactor your queue into a Pub/Sub?
+
+**The log is already the topic.** What makes this a queue rather than a topic
+is that consumption is destructive and there is one shared cursor.
+
+The refactor:
+
+1. Keep the log immutable. Stop letting `ACK` mean "delete"; make it advance a
+   cursor instead.
+2. Give every subscriber group its own cursor and its own ack/in-flight state.
+   `ACK` records become `(group, message)` pairs.
+3. Fan out on publish: one `ENQUEUE` record, N groups that can see it.
+4. Retention stops being "until acked" and becomes time or size based, since a
+   message is no longer removable when the first group finishes with it.
+   Compaction becomes segment expiry.
+
+**The real tension is ordering.** Priority and LIFO are *per-subscriber*
+properties, not properties of the log. Group A consuming priority-first and
+group B consuming FIFO cannot share one global heap, because the heap *is* the
+ordering. Each group needs its own index over the shared log — its own ready
+heap, built from the same records, ordered by its own comparator.
+
+That is the part that would actually cost work. The immutable log, the fan-out
+and the per-group cursors are mechanical; N independent indexes over one log is
+a real memory and rebuild-time cost, and it is why most brokers make you choose
+between "log with offsets" (Kafka, Pulsar) and "queue with per-message
+ordering" (SQS, RabbitMQ) rather than offering both.
+
+### 3. What would you add with more time?
+
+Five, in the order I would actually do them:
+
+1. **Long-poll dequeue.** Consumers currently poll every ~60ms; a `wait_time_ms`
+   that parks the request until a message arrives cuts idle load to nothing and
+   drops delivery latency. Cheapest real win here.
+2. **Segmented log with retention.** One file per queue means compaction
+   rewrites everything. Segments make it O(dead segments) instead of O(live
+   state), and make time/size retention possible — and they are a prerequisite
+   for the Pub/Sub refactor above.
+3. **Metrics endpoint.** Prometheus-format depth, in-flight, oldest-message age,
+   redelivery rate and fsync latency histograms. The numbers already exist in
+   `/stats`; they just need a format an operator's dashboard speaks.
+4. **Batch enqueue.** One request, N messages, one fsync. Group commit already
+   does this for concurrent clients; a batch endpoint gives a single client the
+   same benefit.
+5. **Replication.** Ship the log to a follower and require an ack from it
+   before responding. This is the one that changes the product — everything
+   above is a single-node improvement, and this is what removes "single node"
+   from the limitations list. It is also the largest by a wide margin, which is
+   why it is last.
+
+Deliberately *not* on this list: exactly-once delivery. It is not achievable
+without a transactional consumer, and claiming it would be dishonest.
+
+### 4. Why would anyone choose this over SQS, RabbitMQ, or Pulsar?
+
+For most teams, **they shouldn't**. Those are mature, replicated, operated
+systems and this is a single-node binary written for a take-home. Anyone who
+tells you their weekend queue beats SQS is selling something.
+
+The honest pitch is narrower and, I think, sharper: **the composition is what's
+hard to buy off the shelf.**
+
+- **SQS FIFO** has no priority, no LIFO, and caps delay at 15 minutes. Priority
+  is usually emulated with one queue per level and a consumer that polls them
+  in order — which is a distributed system of its own, and gets the ordering
+  subtly wrong the moment a poll comes back empty.
+- **RabbitMQ** has priority queues, but the levels are bounded, priority
+  interacts awkwardly with consumer prefetch, and there is no LIFO.
+- **Pulsar** can genuinely do most of this, and then you are operating a Pulsar
+  cluster — ZooKeeper or etcd, BookKeeper, brokers — for a workload that fits
+  on one machine.
+
+So: a single static binary, zero external dependencies, arbitrary composition
+of ordering semantics, embeddable as a Go package, and a log format you can
+read in an afternoon. For a team that needs *delayed priority-LIFO* and does
+not want to run a broker to get it, that is a real gap.
+
+**Where it loses, plainly:**
+
+- **Single node. No replication.** The machine is the failure domain. One disk
+  failure is data loss. Every system above survives this; this one does not.
+- **Throughput is bounded by one disk's fsync rate.** Group commit raises the
+  ceiling with concurrency, but the ceiling is still one device.
+- **Memory-resident index.** Every live message's metadata is in RAM. Deep
+  backlogs are bounded by memory, not disk.
+- **No auth, no TLS, no multi-tenancy, no quotas.** It expects a trusted network.
+- **`GET /stats` computes oldest-message age with an O(n) scan** over live
+  messages. Fine at these depths; it would need a fourth heap keyed by
+  `CreatedAt` before it wasn't.
+- **Compaction pauses writes** for its duration, because it runs under the
+  queue mutex. At this scale that is a few milliseconds; a large queue would
+  need an online snapshot with a delta log.
+
+---
+
+## Concurrency
+
+**One `sync.Mutex` per queue**, guarding that queue's index. At this scale it
+is the right call: the critical sections are heap operations and map writes
+measured in hundreds of nanoseconds, and the expensive part of the write path
+(fsync) deliberately happens *outside* the lock.
+
+Each queue owns its own log file and its own mutex, so two queues never
+contend. The manager holds an `RWMutex` over the name→queue map only.
+
+**Where it breaks, and what I'd do:** the first bottleneck would be a single
+hot queue with many producers, where mutex handoff starts to dominate. In
+order: (1) shard by queue name — already free, since queues are independent;
+(2) separate the ready-heap lock from the in-flight map lock, since ack/nack
+touch a map and dequeue touches a heap; (3) shard one queue's ready heap into N
+sub-heaps with a merge on dequeue, which costs strict global ordering and is
+therefore the last resort, not the first.
+
+Choosing the simple thing and knowing where it breaks beats being clever early.
+
+---
+
+## Tests
+
+```bash
+go test ./... -race
+```
+
+| test | what it proves |
+|---|---|
+| `TestKill9MidLoadLosesNothingAcknowledged` | SIGKILL the real server binary under concurrent load; every message confirmed with a 201 survives, every acked message stays gone |
+| `TestKill9PreservesDelayedAndDeadLettered` | delayed and dead-lettered state survives a crash, not just ready messages |
+| `TestServerRefusesToStartOnCorruptLog` | end-to-end: mid-log checksum mismatch → non-zero exit naming the offset → `verify` → `repair` → clean start |
+| `TestServerTruncatesTornTailAndStarts` | a valid header with a missing payload is truncated with a warning, not refused |
+| `TestInflatedLengthIsCorruptionNotATornTail` | regression: a damaged length field is corruption, not a torn write |
+| `TestOrderingModes` / `TestDelayedVariantsRespectTheSameComparator` | all six queue types, exact expected sequences |
+| `TestRestartPreservesOrderingForEveryMode` | ordering after a restart is byte-identical to ordering without one |
+| `TestConcurrentProducersAndConsumers` | 8 producers / 4 consumers: everything delivered, nothing leased twice, nothing acked twice |
+| `TestGroupCommitBatchesConcurrentWriters` | concurrent writers share fsyncs and all records replay, in order |
+| `TestExhaustedAttemptsDeadLetter` / `TestVisibilityExpiryEventuallyDeadLetters` | attempts drive dead-lettering, via both nack and lease expiry |
+| `TestCompactionPreservesSequenceCounter` | compacting an empty queue does not reset `Seq` and reorder future messages |
+
+The crash test asserts on *bounds*, not exact totals, and the width of the band
+is exactly the number of requests in flight when the process died — an
+unanswered request may or may not have committed, and pretending otherwise
+would be testing a fiction.
+
+---
+
+## HTTP API
+
+```
+POST   /queues                              {name, ordering, priority_enabled, max_attempts,
+                                             default_visibility_timeout_ms, aging_interval_ms,
+                                             aging_max_boost, dedup_window_ms}
+GET    /queues                              list with stats
+POST   /queues/{name}/messages              {payload, priority, delay_ms, dedup_id}
+POST   /queues/{name}/dequeue               {max_messages, visibility_timeout_ms}
+POST   /queues/{name}/messages/{id}/ack
+POST   /queues/{name}/messages/{id}/nack
+GET    /queues/{name}/stats                 depth, in-flight, delayed, DLQ, oldest age, fsync stats
+GET    /queues/{name}/dlq                   inspect dead-lettered messages
+GET    /queues/{name}/peek?limit=N          non-destructive view, in comparator order
+POST   /queues/{name}/compact               force compaction
+GET    /healthz
+```
+
+`payload` is any JSON value, stored as the exact bytes you send.
+
+```bash
+curl -X POST localhost:8080/queues \
+  -d '{"name":"jobs","ordering":"lifo","priority_enabled":true,"max_attempts":5}'
+
+curl -X POST localhost:8080/queues/jobs/messages \
+  -d '{"payload":{"task":"resize"},"priority":3,"delay_ms":5000,"dedup_id":"job-42"}'
+
+curl -X POST localhost:8080/queues/jobs/dequeue \
+  -d '{"max_messages":10,"visibility_timeout_ms":30000}'
+```
+
+Status codes: `201` new message, `200` duplicate (with the original id), `404`
+unknown queue or message, `409` ack/nack of a message that isn't leased, `503`
+the log has failed and the queue has stopped accepting work.
+
+---
+
+## Demo
+
+```bash
+go build -o artie-queue ./cmd/artie-queue
+go run ./cmd/jobrunner
+open http://localhost:8081
+```
+
+A worker pool consuming over the real HTTP API — with priority, delay, retries
+and dead-lettering all happening at once rather than demonstrated one at a
+time. Sliders control pool size, failure rate (nack), abandon rate (never ack,
+so the lease expires) and visibility timeout.
+
+The demo **supervises the queue server as a child process**, which is what
+makes two of its panels honest rather than theatrical:
+
+- **Crash lab** — `kill -9` sends a real SIGKILL to a real pid. Restart, and
+  the board repopulates from the log. In-flight leases correctly do not
+  survive: they come back as ready.
+- **Corruption lab** — flip a byte mid-log and the server *refuses to start*,
+  showing you the actual refusal and byte offset; then run the operator repair
+  and watch it come back. Or tear the tail and watch it truncate, warn, and
+  start. This is the panel that found the header-checksum bug.
+
+Also on the page: a live records-per-fsync readout with a **Burst** button, a
+compaction button showing the log shrink, and a dedup demo that submits the
+same `dedup_id` twice and shows the second returning the first one's id.
+
+The five composition tabs are five pre-created queues, because a queue's config
+is immutable — replay derives dead-lettering from `max_attempts`, so the same
+records must always produce the same state. Switching tabs points the workers
+at a different composition.
+
+---
+
+## Notes on what isn't durable, on purpose
+
+**Dequeue writes nothing to the log.** A lease is not durable state: if the
+process dies, every in-flight message correctly reappears as ready, which is
+exactly what lease expiry would have done anyway. The cost is that a crash can
+under-count `Attempts` by one, which is cheaper than an fsync on the read path.
+Lease *expiry* is logged, because attempt counts decide dead-lettering and
+those must survive.
+
+**Compaction** snapshots live state to a temp file, fsyncs it, atomically
+renames it over the log, fsyncs the directory, then swaps the descriptor. A
+crash at any point leaves either the whole old log or the whole new one. The
+snapshot carries `NextSeq` forward explicitly — without it, compacting a fully
+drained queue would reset the sequence counter and reorder new messages against
+already-acknowledged history.
