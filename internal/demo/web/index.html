@@ -99,12 +99,14 @@
   .cards::-webkit-scrollbar { width: 6px; }
   .cards::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
 
+  /* No CSS entrance animation here on purpose. A CSS animation restarts every
+     time an element is detached and re-inserted, and reconciliation moves nodes
+     around — so the whole board would re-animate on every update. New cards are
+     animated once, imperatively, in keyed(). */
   .card {
     background: var(--panel-2); border: 1px solid var(--line); border-left-width: 3px;
     border-radius: 7px; padding: 7px 9px; font-size: 12px;
-    animation: pop .22s ease-out;
   }
-  @keyframes pop { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: none; } }
   .card .row1 { display: flex; align-items: center; gap: 6px; }
   .card .task { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .card .seq { font-family: var(--mono); font-size: 10.5px; color: var(--dimmer); }
@@ -670,8 +672,9 @@ function updateDoneCard(el, c) {
 }
 
 function renderWorkers(workers) {
-  keyed($("workerList"), workers.map(w => ({...w, id: "w" + w.id})),
-        makeWorkerCard, updateWorkerCard);
+  // Worker ids are numbers and unique within this container, so they key it
+  // directly — keyed() stringifies them to match dataset values.
+  keyed($("workerList"), workers, makeWorkerCard, updateWorkerCard);
 }
 
 function makeWorkerCard(w) {
@@ -700,19 +703,47 @@ function updateWorkerCard(el, w) {
   el.dataset.total = w.total_ms || 0;
 }
 
-// keyed reconciliation so cards animate in and out instead of flashing.
+// Keyed reconciliation: reuse the DOM node for an id that is still present,
+// create one for an id that is new, drop the rest.
+//
+// Two details matter for it to be visually quiet. Nodes are only reordered when
+// the order has actually changed, because moving a node through a fragment
+// detaches it from the document — which is wasteful and restarts any CSS
+// animation on it. And the entrance animation is applied imperatively to newly
+// created nodes only, so a card animates once when it appears and never again.
 function keyed(container, items, make, update) {
   const existing = new Map();
   for (const child of Array.from(container.children)) existing.set(child.dataset.id, child);
-  const frag = document.createDocumentFragment();
+
+  const nodes = [];
   for (const it of items) {
-    let node = existing.get(it.id);
-    if (node) { existing.delete(it.id); update(node, it); }
-    else { node = make(it); node.dataset.id = it.id; }
-    frag.appendChild(node);
+    const key = String(it.id);
+    let node = existing.get(key);
+    if (node) {
+      existing.delete(key);
+      update(node, it);
+    } else {
+      node = make(it);
+      node.dataset.id = key;
+      node.animate(
+        [{opacity: 0, transform: "translateY(-5px)"}, {opacity: 1, transform: "none"}],
+        {duration: 220, easing: "ease-out"});
+    }
+    nodes.push(node);
   }
   for (const node of existing.values()) node.remove();
-  container.appendChild(frag);
+
+  let sameOrder = container.children.length === nodes.length;
+  if (sameOrder) {
+    for (let i = 0; i < nodes.length; i++) {
+      if (container.children[i] !== nodes[i]) { sameOrder = false; break; }
+    }
+  }
+  if (!sameOrder) {
+    const frag = document.createDocumentFragment();
+    for (const node of nodes) frag.appendChild(node);
+    container.appendChild(frag);
+  }
 }
 
 // Progress bars tick locally between snapshots, against the server's clock.
