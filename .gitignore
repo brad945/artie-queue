@@ -1,0 +1,12 @@
+# binaries
+/artie-queue
+*.exe
+# queue data
+/data/
+*.log
+*.wal
+# local
+.DS_Store
+.env
+/bin/
+/jobrunner
