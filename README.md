@@ -21,7 +21,7 @@ go run ./cmd/jobrunner              # supervises the server, serves the dashboar
 open http://localhost:8081
 ```
 
-### four relavent questions
+### four relevant questions
 
 Answered in full further down; linked here so they are not buried.
 
