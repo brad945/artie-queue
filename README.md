@@ -21,7 +21,7 @@ go run ./cmd/jobrunner              # supervises the server, serves the dashboar
 open http://localhost:8081
 ```
 
-### The four required answers
+### four relavent questions
 
 Answered in full further down; linked here so they are not buried.
 
@@ -36,9 +36,9 @@ Answered in full further down; linked here so they are not buried.
    mostly you shouldn't; here is the narrow case where you would, and where it
    loses.
 
-### Requirements, and where each is met
+### features
 
-| the assignment asked for | where |
+| features | where |
 |---|---|
 | FIFO or LIFO | `Config.Ordering`, one comparator ([below](#the-one-idea-worth-stealing)) |
 | Priority | `Config.PriorityEnabled`, primary over the mode ([decision 1](#1-priority-is-primary-the-ordering-mode-tie-breaks-within-a-priority-level)) |
@@ -54,7 +54,7 @@ Answered in full further down; linked here so they are not buried.
 
 ## The one idea worth stealing
 
-Four features were asked for. Implementing four features would have been the
+Four features are here. But implementing four features would have been the
 wrong answer. There is **one ordered structure with a configurable
 comparator**, and every queue type falls out of it:
 
