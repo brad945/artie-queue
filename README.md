@@ -1,4 +1,4 @@
-# artie-queue
+# frankenstein-queue
 
 A persistent, composable HTTP queue in Go. FIFO or LIFO, priority, and delay —
 composed freely, so a *delayed priority-LIFO* queue is a configuration, not a
